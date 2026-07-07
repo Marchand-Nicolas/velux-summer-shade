@@ -41,6 +41,7 @@ static std::atomic<uint32_t> s_nextHeartbeatAtMs{0};
 static uint32_t s_lastMqttConnectAttemptMs = 0;
 static constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 static TaskHandle_t s_mqttPostConnectTask = nullptr;
+static bool s_mqttConfigWarningShown = false;
 
 static void mqttSchedulerTask(void*);
 static void publishIohcFrameDiscovery();
@@ -383,9 +384,14 @@ void connectToMqtt() {
         return;
     }
     if (mqtt_server.empty()) {
-        Serial.println("MQTT server not configured");
+        if (!s_mqttConfigWarningShown) {
+            Serial.println("MQTT server not configured; MQTT disabled until a server is set");
+            addLogMessage("MQTT disabled: server not configured");
+            s_mqttConfigWarningShown = true;
+        }
         return;
     }
+    s_mqttConfigWarningShown = false;
     s_lastMqttConnectAttemptMs = millis();
     Serial.printf("Connecting to MQTT at %s:%u...\n", mqtt_server.c_str(), mqtt_port);
     addLogMessage(String("Connecting to MQTT at ") + mqtt_server.c_str() + ":" + String(mqtt_port));
@@ -439,6 +445,7 @@ static void mqttSchedulerTask(void*) {
         const uint32_t now = millis();
 
         if (mqttStatus == ConnState::Disconnected && WiFi.status() == WL_CONNECTED &&
+            !mqtt_server.empty() &&
             static_cast<int32_t>(now - s_lastMqttConnectAttemptMs) >= static_cast<int32_t>(MQTT_RECONNECT_INTERVAL_MS)) {
             connectToMqtt();
         }

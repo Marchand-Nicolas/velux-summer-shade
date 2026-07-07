@@ -35,6 +35,16 @@
 #define BOARD_LED_PIN       37
 #define RADIO_DIO1_PIN      33
 #define RADIO_DIO2_PIN      34
+#elif defined(TTGO_LORA_V13_EXT868)
+#define RADIO_SCLK_PIN       5
+#define RADIO_MISO_PIN      19
+#define RADIO_MOSI_PIN      27
+#define RADIO_CS_PIN        13
+#define RADIO_DIO0_PIN      32
+#define RADIO_RST_PIN       17
+#define BOARD_LED_PIN       25
+#define RADIO_DIO1_PIN      35
+#define RADIO_DIO2_PIN      33 // Wired to SX1276 DIO4 for preamble detection
 #elif defined(LILYGO)
 #define RADIO_SCLK_PIN       5
 #define RADIO_MISO_PIN      19
@@ -71,6 +81,10 @@
 #define I2C_SDA_PIN 18
 #define I2C_SCL_PIN 17
 #define DISPLAY_OLED_RST_PIN -1
+#elif defined(TTGO_LORA_V13_EXT868)
+#define I2C_SDA_PIN 4
+#define I2C_SCL_PIN 15
+#define DISPLAY_OLED_RST_PIN 16
 #elif defined(LILYGO)
 #define I2C_SDA_PIN 21
 #define I2C_SCL_PIN 22

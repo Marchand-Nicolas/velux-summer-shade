@@ -12,6 +12,15 @@
 #include <stdint.h>
 
 #define OLED_ADDRESS 0x3c
+#ifdef OLED_SDA
+#undef OLED_SDA
+#endif
+#ifdef OLED_SCL
+#undef OLED_SCL
+#endif
+#ifdef OLED_RST
+#undef OLED_RST
+#endif
 #define OLED_SDA     I2C_SDA_PIN
 #define OLED_SCL     I2C_SCL_PIN
 #define OLED_RST     DISPLAY_OLED_RST_PIN
