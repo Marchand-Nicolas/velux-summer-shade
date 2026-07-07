@@ -7,17 +7,23 @@
 #include <iohcCryptoHelpers.h>
 #include <iohcRemote1W.h>
 #include <log_buffer.h>
+#include <nvs_helpers.h>
+#include <sys/time.h>
 #include <time.h>
 
 namespace {
 constexpr const char *kTimeZoneParis = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 constexpr uint32_t kCheckIntervalMs = 60UL * 1000UL;
 constexpr uint32_t kNtpRetryIntervalMs = 10UL * 60UL * 1000UL;
+constexpr uint32_t kTimePersistIntervalMs = 30UL * 60UL * 1000UL;
 constexpr time_t kValidEpochThreshold = 1700000000; // 2023-11-14
 
 TaskHandle_t s_schedulerTask = nullptr;
 uint32_t s_lastNtpConfigMs = 0;
+uint32_t s_lastTimePersistMs = 0;
+uint64_t s_lastPersistedEpoch = 0;
 bool s_ntpConfigured = false;
+bool s_timeFallbackAttempted = false;
 int s_lastAppliedYday = -1;
 int s_lastAppliedOpenPercent = -1;
 
@@ -71,6 +77,46 @@ bool localTimeReady(tm &localTime) {
     return localtime_r(&now, &localTime) != nullptr;
 }
 
+void restoreLastKnownTimeIfNeeded() {
+    if (s_timeFallbackAttempted) return;
+    s_timeFallbackAttempted = true;
+
+    if (time(nullptr) >= kValidEpochThreshold) return;
+
+    uint64_t savedEpoch = 0;
+    if (!nvs_read_u64(NVS_KEY_LAST_EPOCH, savedEpoch) ||
+        savedEpoch < static_cast<uint64_t>(kValidEpochThreshold)) {
+        Serial.println("Summer shade: no saved time available for offline mode");
+        return;
+    }
+
+    timeval tv {};
+    tv.tv_sec = static_cast<time_t>(savedEpoch);
+    settimeofday(&tv, nullptr);
+    s_lastPersistedEpoch = savedEpoch;
+    Serial.printf("Summer shade: restored offline clock from saved epoch %llu\n",
+                  static_cast<unsigned long long>(savedEpoch));
+}
+
+void persistCurrentTimeIfNeeded(bool force = false) {
+    const time_t now = time(nullptr);
+    if (now < kValidEpochThreshold) return;
+
+    const uint64_t epoch = static_cast<uint64_t>(now);
+    const bool timeJumped =
+        s_lastPersistedEpoch != 0 &&
+        (epoch > s_lastPersistedEpoch + 120 || s_lastPersistedEpoch > epoch + 120);
+    const uint32_t nowMs = millis();
+    if (!force && !timeJumped && s_lastTimePersistMs != 0 &&
+        static_cast<int32_t>(nowMs - s_lastTimePersistMs) < static_cast<int32_t>(kTimePersistIntervalMs)) {
+        return;
+    }
+
+    nvs_write_u64(NVS_KEY_LAST_EPOCH, epoch);
+    s_lastPersistedEpoch = epoch;
+    s_lastTimePersistMs = nowMs;
+}
+
 void ensureNtpConfigured() {
     if (WiFi.status() != WL_CONNECTED) return;
 
@@ -110,11 +156,20 @@ void sendTargetPosition(const std::string &description, int openPercent) {
 }
 
 void schedulerTask(void *) {
+    setenv("TZ", kTimeZoneParis, 1);
+    tzset();
+    restoreLastKnownTimeIfNeeded();
+
     while (true) {
         ensureNtpConfigured();
 
         tm localTime {};
-        if (localTimeReady(localTime) && isDateInSeason(localTime)) {
+        const bool timeReady = localTimeReady(localTime);
+        if (timeReady) {
+            persistCurrentTimeIfNeeded();
+        }
+
+        if (timeReady && isDateInSeason(localTime)) {
             int openPercent = 0;
             if (targetForHour(localTime.tm_hour, openPercent) &&
                 (s_lastAppliedYday != localTime.tm_yday ||
@@ -122,6 +177,7 @@ void schedulerTask(void *) {
                 std::string description;
                 if (resolveTargetDescription(description)) {
                     sendTargetPosition(description, openPercent);
+                    persistCurrentTimeIfNeeded(true);
                     s_lastAppliedYday = localTime.tm_yday;
                     s_lastAppliedOpenPercent = openPercent;
                 } else {

@@ -16,6 +16,7 @@ static constexpr char NVS_KEY_SYSLOG_SERVER[] = "syslog_server";
 static constexpr char NVS_KEY_SYSLOG_PORT[] = "syslog_port";
 static constexpr char NVS_KEY_SYSLOG_TAG[] = "syslog_tag";
 static constexpr char NVS_KEY_DISPLAY_ENABLED[] = "display_on";
+static constexpr char NVS_KEY_LAST_EPOCH[] = "last_epoch";
 
 
 bool nvs_init();
@@ -26,6 +27,8 @@ bool nvs_read_string(const char *key, std::string &value);
 void nvs_write_string(const char *key, const std::string &value);
 bool nvs_read_u16(const char *key, uint16_t &value);
 void nvs_write_u16(const char *key, uint16_t value);
+bool nvs_read_u64(const char *key, uint64_t &value);
+void nvs_write_u64(const char *key, uint64_t value);
 bool nvs_read_bool(const char *key, bool &value);
 void nvs_write_bool(const char *key, bool value);
 

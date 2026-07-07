@@ -29,6 +29,7 @@
 #include <tuple>
 
 const long PORTAL_TIMEOUT = 300000; // 5 minuten = 300.000 ms
+const uint32_t WIFI_RECONNECT_INTERVAL_SEC = 10;
 const uint32_t WIFI_NOTIFY_GOT_IP = BIT0;
 const uint32_t WIFI_NOTIFY_DISCONNECTED = BIT1;
 const uint32_t WIFI_NOTIFY_RECONNECT = BIT2;
@@ -41,6 +42,8 @@ WiFiStatus wifiStatus = { ConnState::Disconnected, 0, 0 };
 TaskHandle_t wifiWorkerTaskHandle = NULL;
 bool mdnsStarted = false;
 bool webServerStarted = false;
+bool maxTxPowerLogged = false;
+bool maxTxPowerWarningLogged = false;
 
 // Replicate WiFiManager::getRSSIasQuality() without constructing a WiFiManager object.
 static int rssiToQuality(int rssi) {
@@ -116,7 +119,7 @@ static void configureWifiDisconnected() {
     wifiStatus.signalStrengthPercent = 0;
     wifiStatus.rssi = 0;
     rssiTimer.detach();
-    wifiReconnectTimer.attach(10, wifiReconnectTimerCb);
+    wifiReconnectTimer.attach(WIFI_RECONNECT_INTERVAL_SEC, wifiReconnectTimerCb);
     mdnsStarted = false;
     updateDisplayStatus();
 }
@@ -124,6 +127,21 @@ static void configureWifiDisconnected() {
 static void handleWifiDisconnected() {
     if (wifiStatus.connectionStatus == ConnState::Connected) {
         configureWifiDisconnected();
+    }
+}
+
+static void applyMaxWiFiTxPower() {
+    if (!WiFi.setTxPower(WIFI_POWER_19_5dBm)) {
+        if (!maxTxPowerWarningLogged) {
+            Serial.println("WiFi: failed to set TX power to maximum");
+            maxTxPowerWarningLogged = true;
+        }
+        return;
+    }
+
+    if (!maxTxPowerLogged) {
+        Serial.println("WiFi: TX power set to maximum (19.5 dBm)");
+        maxTxPowerLogged = true;
     }
 }
 
@@ -140,6 +158,7 @@ static void applyAdvancedWiFiSettings() {
 #endif // REQUIRE_MINIMUM_WPA2_PSK
         esp_wifi_set_config(WIFI_IF_STA, &config);
     }
+    applyMaxWiFiTxPower();
 }
 
 static std::string getConfiguredSSID() {
@@ -235,8 +254,11 @@ static void wifiWorker(void * pvParameters) {
         Serial.printf("WiFi: Attempt connection to '%s', try for max 30 seconds...\n", ssid.c_str());
         status = (wl_status_t)WiFi.waitForConnectResult(30000);
     }
-    if (status != WL_CONNECTED) {
+    if (status != WL_CONNECTED && !hasWifiConfiguration) {
         runConfigPortal(ssid, hasWifiConfiguration);
+    } else if (status != WL_CONNECTED) {
+        Serial.printf("WiFi: '%s' unavailable; continuing offline and retrying every %u seconds.\n",
+                      ssid.c_str(), WIFI_RECONNECT_INTERVAL_SEC);
     }
 
     if (WiFi.status() != WL_CONNECTED) {
