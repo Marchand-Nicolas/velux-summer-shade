@@ -55,6 +55,11 @@ inline std::string syslog_tag = "";    // Optional tag prepended to hostname for
 // Comment out the next line to disable the built-in web server
 #define WEBSERVER
 
+// Summer shade automation: from May 15 through September 15, partially closes
+// the configured 1W device during the brightest hours and reopens it by 17:00.
+#define SUMMER_SHADE_AUTOMATION
+inline std::string summer_shade_target = "Velux"; // Matches 1W description or display name
+
 #define HTTP_LISTEN_PORT    80
 #define HTTP_USERNAME       "admin"
 #define HTTP_PASSWORD       "admin"

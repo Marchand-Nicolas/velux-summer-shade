@@ -37,6 +37,7 @@
 #endif
 #include <wifi_helper.h>
 #include <nvs_helpers.h>
+#include <summer_shade_scheduler.h>
 #include "log_buffer.h"
 #include <stdarg.h>
 #include <algorithm>
@@ -145,6 +146,7 @@ void setup() {
 #if defined(MQTT)
     initMqtt();
 #endif
+    initSummerShadeScheduler();
     Cmd::kbd_tick.attach_ms(500, Cmd::cmdFuncHandler);
 
 //    esp_timer_dump(stdout);
