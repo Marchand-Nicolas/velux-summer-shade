@@ -192,3 +192,17 @@ Image [miopen.io](https://miopen.io) © 2025 by [djbenbe](https://creativecommon
 <img src="https://mirrors.creativecommons.org/presskit/icons/by.svg" alt="BY" style="width:0.2em; height:0.2em;margin-left:.2em;">
 <img src="https://mirrors.creativecommons.org/presskit/icons/nc.svg" alt="NC" style="width:0.2em; height:0.2em; margin-left:.2em;">
 <img src="https://mirrors.creativecommons.org/presskit/icons/nd.svg" alt="ND" style="width:0.2em; height:0.2em; margin-left:.2em;">
+
+## Links
+
+| SX1276 | ESP32 |
+|---|---:|
+| VCC | 3V3 |
+| GND | GND |
+| SCK | GPIO5 |
+| MISO | GPIO19 |
+| MOSI | GPIO27 |
+| NSS / CS | GPIO13 |
+| DIO0 | GPIO32 |
+| RST / RESET | GPIO17 |
+| DIO4 | GPIO33 |

@@ -18,3 +18,5 @@ src/CMakeLists.txt
 /archives/
 *.org
 include/user_config.h
+littlefs-dump.bin
+recovered-1W.json

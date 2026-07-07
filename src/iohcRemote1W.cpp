@@ -35,6 +35,51 @@
 namespace IOHC {
     iohcRemote1W* iohcRemote1W::_iohcRemote1W = nullptr;
     static constexpr uint32_t DEFAULT_TRAVEL_TIME_SEC = 10;
+    static constexpr const char *REMOTE_SETTINGS_TEMP = "/1W.json.tmp";
+    static constexpr const char *REMOTE_SETTINGS_BACKUP = "/1W.json.bak";
+
+    static bool copyRemoteSettingsFile(const char *source, const char *destination) {
+        fs::File input = LittleFS.open(source, "r");
+        if (!input) {
+            Serial.printf("Failed to open %s for restore\n", source);
+            return false;
+        }
+
+        LittleFS.remove(destination);
+        fs::File output = LittleFS.open(destination, "w");
+        if (!output) {
+            input.close();
+            Serial.printf("Failed to open %s for restore\n", destination);
+            return false;
+        }
+
+        uint8_t buffer[128];
+        bool ok = true;
+        while (input.available()) {
+            const size_t read = input.read(buffer, sizeof(buffer));
+            if (output.write(buffer, read) != read) {
+                ok = false;
+                break;
+            }
+        }
+
+        output.flush();
+        output.close();
+        input.close();
+
+        if (!ok) {
+            LittleFS.remove(destination);
+            Serial.printf("Failed to copy %s to %s\n", source, destination);
+        }
+        return ok;
+    }
+
+    static bool restoreRemoteSettingsCandidate(const char *source, const char *reason) {
+        if (!LittleFS.exists(source)) return false;
+
+        Serial.printf("Restoring %s from %s (%s)\n", IOHC_1W_REMOTE, source, reason);
+        return copyRemoteSettingsFile(source, IOHC_1W_REMOTE);
+    }
 
     static void positionTaskLoop(void *arg) {
         auto *inst = static_cast<iohcRemote1W *>(arg);
@@ -648,25 +693,51 @@ Every 9 -> 0x20 12:41:28.171 > (23) 1W S 1 E 1  FROM B60D1A TO 00003F CMD 20 <  
    bool iohcRemote1W::load() {
         _radioInstance = iohcRadio::getInstance();
 
-        if (LittleFS.exists(IOHC_1W_REMOTE))
+        JsonDocument doc;
+        bool triedBackupRestore = false;
+        bool triedTempRestore = false;
+
+        while (true) {
+            if (!LittleFS.exists(IOHC_1W_REMOTE)) {
+                if (!triedBackupRestore &&
+                    restoreRemoteSettingsCandidate(REMOTE_SETTINGS_BACKUP, "main file missing")) {
+                    triedBackupRestore = true;
+                    continue;
+                }
+                if (!triedTempRestore &&
+                    restoreRemoteSettingsCandidate(REMOTE_SETTINGS_TEMP, "main file missing")) {
+                    triedTempRestore = true;
+                    continue;
+                }
+
+                Serial.printf("*1W remote not available\n");
+                return false;
+            }
+
             Serial.printf("Loading 1W remote settings from %s\n", IOHC_1W_REMOTE);
-        else {
-            Serial.printf("*1W remote not available\n");
-            return false;
-        }
+            fs::File f = LittleFS.open(IOHC_1W_REMOTE, "r");
+            DeserializationError error = deserializeJson(doc, f);
+            f.close();
 
-        fs::File f = LittleFS.open(IOHC_1W_REMOTE, "r");
-        JsonDocument doc; 
+            if (!error) break;
 
-        DeserializationError error = deserializeJson(doc, f); 
-
-        if (error) {
             Serial.print("Failed to parse JSON: ");
             Serial.println(error.c_str());
-            f.close();
+
+            doc.clear();
+            if (!triedBackupRestore &&
+                restoreRemoteSettingsCandidate(REMOTE_SETTINGS_BACKUP, "main file parse failed")) {
+                triedBackupRestore = true;
+                continue;
+            }
+            if (!triedTempRestore &&
+                restoreRemoteSettingsCandidate(REMOTE_SETTINGS_TEMP, "main file parse failed")) {
+                triedTempRestore = true;
+                continue;
+            }
+
             return false;
         }
-        f.close();
 
         // Iterate through the JSON object
         bool updateFile = false;
@@ -769,12 +840,10 @@ Every 9 -> 0x20 12:41:28.171 > (23) 1W S 1 E 1  FROM B60D1A TO 00003F CMD 20 <  
             return false;
         }
 
-        constexpr const char *tempFile = "/1W.json.tmp";
-        constexpr const char *backupFile = "/1W.json.bak";
-        LittleFS.remove(tempFile);
-        fs::File f = LittleFS.open(tempFile, "w");
+        LittleFS.remove(REMOTE_SETTINGS_TEMP);
+        fs::File f = LittleFS.open(REMOTE_SETTINGS_TEMP, "w");
         if (!f) {
-            Serial.printf("Failed to open temporary 1W settings file %s\n", tempFile);
+            Serial.printf("Failed to open temporary 1W settings file %s\n", REMOTE_SETTINGS_TEMP);
             return false;
         }
         JsonDocument doc;
@@ -816,27 +885,31 @@ Every 9 -> 0x20 12:41:28.171 > (23) 1W S 1 E 1  FROM B60D1A TO 00003F CMD 20 <  
         f.flush();
         f.close();
         if (written == 0) {
-            LittleFS.remove(tempFile);
+            LittleFS.remove(REMOTE_SETTINGS_TEMP);
             Serial.println("Failed to serialize 1W settings");
             return false;
         }
 
-        LittleFS.remove(backupFile);
+        if (LittleFS.exists(REMOTE_SETTINGS_BACKUP) &&
+            !LittleFS.remove(REMOTE_SETTINGS_BACKUP)) {
+            LittleFS.remove(REMOTE_SETTINGS_TEMP);
+            Serial.println("Failed to remove previous 1W settings backup");
+            return false;
+        }
         if (LittleFS.exists(IOHC_1W_REMOTE) &&
-            !LittleFS.rename(IOHC_1W_REMOTE, backupFile)) {
-            LittleFS.remove(tempFile);
+            !LittleFS.rename(IOHC_1W_REMOTE, REMOTE_SETTINGS_BACKUP)) {
+            LittleFS.remove(REMOTE_SETTINGS_TEMP);
             Serial.println("Failed to back up 1W settings file");
             return false;
         }
-        if (!LittleFS.rename(tempFile, IOHC_1W_REMOTE)) {
+        if (!LittleFS.rename(REMOTE_SETTINGS_TEMP, IOHC_1W_REMOTE)) {
             Serial.println("Failed to replace 1W settings file");
-            LittleFS.remove(tempFile);
-            if (LittleFS.exists(backupFile)) {
-                LittleFS.rename(backupFile, IOHC_1W_REMOTE);
+            LittleFS.remove(REMOTE_SETTINGS_TEMP);
+            if (LittleFS.exists(REMOTE_SETTINGS_BACKUP)) {
+                copyRemoteSettingsFile(REMOTE_SETTINGS_BACKUP, IOHC_1W_REMOTE);
             }
             return false;
         }
-        LittleFS.remove(backupFile);
 
         return true;
     }

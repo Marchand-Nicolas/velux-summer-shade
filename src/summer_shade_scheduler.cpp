@@ -48,11 +48,7 @@ bool isDateInSeason(const tm &localTime) {
 
 bool targetForHour(int hour, int &openPercent) {
     if (hour < 10) return false;
-
-    if (hour >= 17) {
-        openPercent = 100;
-        return true;
-    }
+    if (hour >= 18) return false;
 
     if (hour == 14) {
         openPercent = 20;
