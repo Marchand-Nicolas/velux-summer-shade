@@ -18,6 +18,22 @@ Please be advised that the modification to this code have mainly be focussing on
 
 ---
 
+### TTGO LoRa V1.3 + SX1276 Wiring
+
+| SX1276 | ESP32 |
+|---|---:|
+| VCC | 3V3 |
+| GND | GND |
+| SCK | GPIO5 |
+| MISO | GPIO19 |
+| MOSI | GPIO27 |
+| NSS / CS | GPIO13 |
+| DIO0 | GPIO32 |
+| RST / RESET | GPIO17 |
+| DIO4 | GPIO33 |
+
+---
+
 ### **Disclaimer**  
 Tool designed for educational and testing purposes, provided "as is", without warranty of any kind. Creators and contributors are not responsible for any misuse or damage caused by this tool.
 
@@ -192,17 +208,3 @@ Image [miopen.io](https://miopen.io) © 2025 by [djbenbe](https://creativecommon
 <img src="https://mirrors.creativecommons.org/presskit/icons/by.svg" alt="BY" style="width:0.2em; height:0.2em;margin-left:.2em;">
 <img src="https://mirrors.creativecommons.org/presskit/icons/nc.svg" alt="NC" style="width:0.2em; height:0.2em; margin-left:.2em;">
 <img src="https://mirrors.creativecommons.org/presskit/icons/nd.svg" alt="ND" style="width:0.2em; height:0.2em; margin-left:.2em;">
-
-## Links
-
-| SX1276 | ESP32 |
-|---|---:|
-| VCC | 3V3 |
-| GND | GND |
-| SCK | GPIO5 |
-| MISO | GPIO19 |
-| MOSI | GPIO27 |
-| NSS / CS | GPIO13 |
-| DIO0 | GPIO32 |
-| RST / RESET | GPIO17 |
-| DIO4 | GPIO33 |
