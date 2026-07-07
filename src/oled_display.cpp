@@ -28,6 +28,7 @@
 #include <chrono>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <time.h>
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 DisplayBuffer displayBuffer;
@@ -41,6 +42,8 @@ void displayTask(void *);
 const int MILLIS_BETWEEN_DISPLAY_UPDATE_SLOW = 5000;
 const int MILLIS_BETWEEN_DISPLAY_UPDATE_FAST = 100;
 const int SECONDS_BEFORE_SCREENSAVER = 60;
+const time_t VALID_CLOCK_THRESHOLD = 1700000000; // 2023-11-14
+const char *DISPLAY_TIME_ZONE = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
 const uint8_t PROGMEM miopenioLogo[] =
 {
@@ -154,6 +157,9 @@ bool initDisplay() {
         displayEnabled = enabled;
     }
 
+    setenv("TZ", DISPLAY_TIME_ZONE, 1);
+    tzset();
+
     Wire.begin(OLED_SDA, OLED_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
         return false;
@@ -182,6 +188,22 @@ int getSecondsSinceStart() {
 
 int getSecondsSinceNoData() {
     return (esp_timer_get_time() - lastDataTime) / 1000000LL;;
+}
+
+std::string getClockText() {
+    const time_t now = time(nullptr);
+    if (now < VALID_CLOCK_THRESHOLD) {
+        return "--:--";
+    }
+
+    tm localTime {};
+    if (localtime_r(&now, &localTime) == nullptr) {
+        return "--:--";
+    }
+
+    char buffer[6];
+    strftime(buffer, sizeof(buffer), "%H:%M", &localTime);
+    return std::string(buffer);
 }
 
 const char* getRemoteName(const uint8_t *remote, const char *name) {
@@ -281,14 +303,20 @@ void drawHeader() {
 }
 
 void drawFooter() {
+    display.setCursor(1, 56);
+    display.print(getClockText().c_str());
+    display.print(" | ");
+
+    display.setCursor(38, 56);
     if (wifiStatus.connectionStatus == ConnState::Connected) {
-        display.setCursor(1, 56);
         // every 10 seconds alternate between url and ip
         if (getSecondsSinceStart() / 10 % 2 == 0) {
-            display.println("http://miopenio.local");
+            display.println("miopenio.local");
         } else {
-            display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+            display.println(WiFi.localIP().toString().c_str());
         }
+    } else {
+        display.println("WiFi offline");
     }
 }
 
@@ -323,8 +351,11 @@ void drawData() {
 void drawLogo() {
     // draw logo at random position to avoid burn-in
     const int x = 50.0 * std::rand() / RAND_MAX; // number between 0 and 50
-    const int y = 48.0 * std::rand() / RAND_MAX; // number between 0 and 48
+    const int y = 36.0 * std::rand() / RAND_MAX; // number between 0 and 36
     drawLogo(x, y);
+
+    display.setCursor(x + 20, y + 16);
+    display.print(getClockText().c_str());
 }
 
 void displayTask(void *) {
