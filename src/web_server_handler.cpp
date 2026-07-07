@@ -35,6 +35,63 @@
 AsyncWebServer server(80); // Create AsyncWebServer object on port 80
 AsyncWebSocket ws("/ws");
 
+static constexpr const char *WEB_ROOT = "/web_interface_data";
+static constexpr const char *WEB_INDEX = "/web_interface_data/index.html";
+
+static bool shouldServeIndexFor(const String &url) {
+  return url == "/" || url.lastIndexOf('.') < 0;
+}
+
+static bool isKnownWebAssetPath(const String &url) {
+  return url == "/index.html" || url.startsWith("/css/") ||
+         url.startsWith("/js/") || url.startsWith("/img/") ||
+         url.startsWith("/lang/");
+}
+
+static void sendWebInterfaceFile(AsyncWebServerRequest *request,
+                                 const String &fsPath) {
+  fs::File file = LittleFS.open(fsPath, fs::FileOpenMode::read);
+  if (!file || file.isDirectory()) {
+    request->send(404, "text/plain", "Not found");
+    return;
+  }
+
+  AsyncWebServerResponse *response =
+      request->beginResponse(file, fsPath, "", false);
+  response->addHeader("Cache-Control", "no-cache", false);
+  request->send(response);
+}
+
+static void handleStaticWebRequest(AsyncWebServerRequest *request) {
+  if (request->method() != HTTP_GET && request->method() != HTTP_HEAD) {
+    request->send(405, "text/plain", "Method not allowed");
+    return;
+  }
+
+  const String url = request->url();
+  if (url.startsWith("/api") || url.startsWith("/ws")) {
+    request->send(404, "text/plain", "Not found");
+    return;
+  }
+
+  if (url.indexOf("..") >= 0) {
+    request->send(400, "text/plain", "Bad request");
+    return;
+  }
+
+  String fsPath;
+  if (shouldServeIndexFor(url)) {
+    fsPath = WEB_INDEX;
+  } else if (!isKnownWebAssetPath(url) || url.endsWith(".gz")) {
+    request->send(404, "text/plain", "Not found");
+    return;
+  } else {
+    fsPath = String(WEB_ROOT) + url;
+  }
+
+  sendWebInterfaceFile(request, fsPath);
+}
+
 static void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                       AwsEventType type, void *arg, uint8_t *data,
                       size_t len) {
@@ -750,11 +807,7 @@ void handleFilesystemUpload(AsyncWebServerRequest *request, String filename,
 void setupWebServer() {
   Serial.println("Initializing HTTP server ...");
 
-  // Serve static files from /web_interface_data
-  // Ensure this path matches where your platformio.ini places data files
-  // or how you upload them (e.g., SPIFFS, LittleFS).
-  // The path "/" serves index.html from the data directory.
-  if (!LittleFS.exists("/web_interface_data/index.html")) {
+  if (!LittleFS.exists(WEB_INDEX)) {
     Serial.println("Warning: /web_interface_data/index.html not found");
   }
 
@@ -799,28 +852,7 @@ void setupWebServer() {
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
-  auto &staticHandler =
-      server.serveStatic("/", LittleFS, "/web_interface_data/");
-  staticHandler.setDefaultFile("index.html");
-  staticHandler.setFilter([](AsyncWebServerRequest *request) {
-    return !request->url().startsWith("/api");
-  });
-  // You might need to explicitly serve each file if serveStatic with directory
-  // isn't working as expected or if files are not in a subdirectory of the data
-  // dir. server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-  //     request->send(LittleFS, "/web_interface_data/index.html", "text/html");
-  // });
-  // server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest *request){
-  //     request->send(LittleFS, "/web_interface_data/style.css", "text/css");
-  // });
-  // server.on("/script.js", HTTP_GET, [](AsyncWebServerRequest *request){
-  //     request->send(LittleFS, "/web_interface_data/script.js",
-  //     "application/javascript");
-  // });
-
-  server.onNotFound([](AsyncWebServerRequest *request) {
-    request->send(404, "text/plain", "Not found");
-  });
+  server.onNotFound(handleStaticWebRequest);
 
   server.begin();
   Serial.println("HTTP server started");
