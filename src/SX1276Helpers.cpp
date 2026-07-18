@@ -66,7 +66,7 @@ namespace Radio {
  * The function `initHardware` initializes the hardware for SPI communication with a radio chip, checks
  * the availability of the radio, configures SPI settings, and puts the radio chip in standby mode.
  */
-    void initHardware() {
+    bool initHardware() {
         printf("\nSPI Init");
 
         //gpio_pullup_en((gpio_num_t) RADIO_MISO);
@@ -106,17 +106,51 @@ namespace Radio {
         // SPI.beginTransaction(Radio::SpiSettings);
         // SPI.endTransaction();
 
-        writeByte(REG_OPMODE, RF_OPMODE_STANDBY); // Put Radio in Standby mode
+        // Reset the SX1276 explicitly. An ESP32 reset does not power-cycle the
+        // radio, so it may otherwise retain a wedged TX/sequencer state.
+        if (!hardReset()) {
+            return false;
+        }
 
         pinMode(SCAN_LED, OUTPUT);
         digitalWrite(SCAN_LED, 1);
         printf("\nRadio Chip is ready\n");
+        return true;
+    }
+
+    bool hardReset() {
+        pinMode(RADIO_NSS, OUTPUT);
+        digitalWrite(RADIO_NSS, HIGH);
+        pinMode(RADIO_RESET, OUTPUT);
+        digitalWrite(RADIO_RESET, LOW);
+        delayMicroseconds(200);
+        digitalWrite(RADIO_RESET, HIGH);
+        delay(6);
+
+        const uint8_t version = readByte(REG_VERSION);
+        if (version != 0x12) {
+            ets_printf("Radio: reset failed, unexpected version 0x%02X\n", version);
+            return false;
+        }
+
+        // Reset leaves the FSK modem in Sleep. Image calibration only runs
+        // once the oscillator is active in Standby.
+        writeByte(REG_OPMODE, RF_OPMODE_STANDBY);
+        const uint64_t readyDeadline = esp_timer_get_time() + 5000;
+        while (!(readByte(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY)) {
+            if (esp_timer_get_time() >= readyDeadline) {
+                ets_printf("Radio: failed to enter standby after reset\n");
+                return false;
+            }
+            delayMicroseconds(10);
+        }
+        return true;
     }
 
 void setPreambleLength(uint16_t preambleLen) {
     writeByte(REG_PREAMBLEMSB, (preambleLen >> 8) & 0xFF);
     writeByte(REG_PREAMBLELSB, preambleLen & 0xFF);
-    ets_printf("Radio: Preamble length set to %u symbols\n", preambleLen);
+    ets_printf("Radio: Preamble length set to %u bytes\n", preambleLen);
 }
 
 /**
@@ -221,7 +255,20 @@ void setPreambleLength(uint16_t preambleLen) {
  * The `calibrate` function in C++ performs radio calibration by adjusting power levels and setting the
  * frequency band.
  */
-    void calibrate() {
+    bool calibrate(uint32_t timeoutUs) {
+        const auto waitForCalibration = [timeoutUs]() {
+            const uint64_t deadline = esp_timer_get_time() + timeoutUs;
+            while ((readByte(REG_IMAGECAL) & RF_IMAGECAL_IMAGECAL_RUNNING) ==
+                   RF_IMAGECAL_IMAGECAL_RUNNING) {
+                if (esp_timer_get_time() >= deadline) {
+                    ets_printf("Radio: image calibration timed out\n");
+                    return false;
+                }
+                delayMicroseconds(50);
+            }
+            return true;
+        };
+
         // Save context
         uint8_t regPaConfigInitVal = readByte(REG_PACONFIG);
 
@@ -230,22 +277,31 @@ void setPreambleLength(uint16_t preambleLen) {
         // RC Calibration (only call after setting correct frequency band)
         writeByte(REG_OSC, RF_OSC_RCCALSTART);
         // Start image and RSSI calibration
-        writeByte(
-            REG_IMAGECAL, (RF_IMAGECAL_AUTOIMAGECAL_MASK & RF_IMAGECAL_IMAGECAL_MASK) | RF_IMAGECAL_IMAGECAL_START);
+        writeByte(REG_IMAGECAL,
+                  (readByte(REG_IMAGECAL) & RF_IMAGECAL_AUTOIMAGECAL_MASK &
+                   RF_IMAGECAL_IMAGECAL_MASK) |
+                  RF_IMAGECAL_IMAGECAL_START);
         // Wait end of calibration
-        while ((readByte(REG_IMAGECAL) & RF_IMAGECAL_IMAGECAL_RUNNING) == RF_IMAGECAL_IMAGECAL_RUNNING) {
+        if (!waitForCalibration()) {
+            writeByte(REG_PACONFIG, regPaConfigInitVal);
+            return false;
         }
         // Set a Frequency in HF band
         Radio::setCarrier(Radio::Carrier::Frequency, 868000000);
         // Start image and RSSI calibration
-        writeByte(
-            REG_IMAGECAL, (RF_IMAGECAL_AUTOIMAGECAL_MASK & RF_IMAGECAL_IMAGECAL_MASK) | RF_IMAGECAL_IMAGECAL_START);
+        writeByte(REG_IMAGECAL,
+                  (readByte(REG_IMAGECAL) & RF_IMAGECAL_AUTOIMAGECAL_MASK &
+                   RF_IMAGECAL_IMAGECAL_MASK) |
+                  RF_IMAGECAL_IMAGECAL_START);
         // Wait end of calibration
-        while ((readByte(REG_IMAGECAL) & RF_IMAGECAL_IMAGECAL_RUNNING) == RF_IMAGECAL_IMAGECAL_RUNNING) {
+        if (!waitForCalibration()) {
+            writeByte(REG_PACONFIG, regPaConfigInitVal);
+            return false;
         }
 
         // Restore context
         writeByte(REG_PACONFIG, regPaConfigInitVal);
+        return true;
     }
 
     /*!
@@ -289,21 +345,37 @@ void setPreambleLength(uint16_t preambleLen) {
         writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_STANDBY);
     }
 
-    void IRAM_ATTR setTx() {
+    bool IRAM_ATTR setTx(uint32_t readyTimeoutUs) {
         // Uncommon and incompatible settings
         // Enabling Sync word - Size must be set to SYNCSIZE_2 (0x01 in header file)
         writeByte(REG_SYNCCONFIG, (readByte(REG_SYNCCONFIG) & RF_SYNCCONFIG_SYNCSIZE_MASK) | RF_SYNCCONFIG_SYNCSIZE_2);
         writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_TRANSMITTER);
 
-        TxReady;
+        const uint64_t deadline = esp_timer_get_time() + readyTimeoutUs;
+        while (!(readByte(REG_IRQFLAGS1) & RF_IRQFLAGS1_TXREADY)) {
+            if (esp_timer_get_time() >= deadline) {
+                return false;
+            }
+            delayMicroseconds(10);
+        }
+        return true;
     }
 
-    void IRAM_ATTR setRx() {
+    bool IRAM_ATTR setRx(uint32_t readyTimeoutUs) {
         // Uncommon and incompatible settings
         writeByte(REG_SYNCCONFIG, (readByte(REG_SYNCCONFIG) & RF_SYNCCONFIG_SYNCSIZE_MASK) | RF_SYNCCONFIG_SYNCSIZE_3);
         writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_RECEIVER);
 
-        RxReady;
+        const uint64_t deadline = esp_timer_get_time() + readyTimeoutUs;
+        // The existing receiver sequence intentionally starts as soon as the
+        // RX PLL locks; RxReady is not asserted in every sequencer state.
+        while (!(readByte(REG_IRQFLAGS1) & RF_IRQFLAGS1_PLLLOCK)) {
+            if (esp_timer_get_time() >= deadline) {
+                return false;
+            }
+            delayMicroseconds(10);
+        }
+        return true;
         /*
                 // Start Sequencer
                 writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_RECEIVER);
@@ -342,9 +414,10 @@ void setPreambleLength(uint16_t preambleLen) {
     //   writeByte(REG_IRQFLAGS1, flags);
     // }
     void IRAM_ATTR clearFlags() {
-        uint16_t flags = readWord(REG_IRQFLAGS1);
-        flags &= ~0xFFFF; // Efface tous les drapeaux
-        writeWord(REG_IRQFLAGS1, flags);
+        // Clear the write-to-clear IRQ bits. Live packet-mode status bits are
+        // cleared by the surrounding FIFO drain or RX/TX mode transition.
+        uint8_t flags[2] = {0xFF, 0xFF};
+        writeBytes(REG_IRQFLAGS1, flags, sizeof(flags));
     }
 
     bool IRAM_ATTR preambleDetected() {

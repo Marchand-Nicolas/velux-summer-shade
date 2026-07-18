@@ -22,8 +22,25 @@
 #include <iohcRadio.h>
 #include <utility>
 #include <log_buffer.h>
-#define LONG_PREAMBLE_MS 1920
-#define SHORT_PREAMBLE_MS 40
+
+namespace {
+    constexpr uint16_t LONG_PREAMBLE_BYTES = 1920;
+    constexpr uint16_t SHORT_PREAMBLE_BYTES = 40;
+    constexpr uint32_t IOHC_BITRATE_BPS = 38400;
+    constexpr uint64_t TX_WATCHDOG_MARGIN_US = 250000;
+    constexpr uint64_t TX_WAIT_LOG_INTERVAL_US = 250000;
+    constexpr uint8_t MAX_TX_RECOVERY_ATTEMPTS = 1;
+    constexpr TickType_t RX_PREAMBLE_TIMEOUT_TICKS = pdMS_TO_TICKS(800);
+
+    uint64_t txWatchdogDurationUs(uint16_t preambleBytes, uint8_t payloadBytes) {
+        // FSK RegPreambleSize is expressed in bytes. IO-homecontrol adds start
+        // and stop bits, so each byte occupies ten bits on air. Include sync,
+        // length and CRC bytes, then leave a margin for task scheduling.
+        const uint64_t bytesOnAir = preambleBytes + payloadBytes + 5ULL;
+        return ((bytesOnAir * 10ULL * 1000000ULL) / IOHC_BITRATE_BPS) +
+               TX_WATCHDOG_MARGIN_US;
+    }
+}
 
 namespace IOHC {
     iohcRadio *iohcRadio::_iohcRadio = nullptr;
@@ -55,11 +72,27 @@ namespace IOHC {
         static uint32_t thread_notification;
         const TickType_t xMaxBlockTime = pdMS_TO_TICKS(655 * 4); // 218.4 );
         while (true) {
-            thread_notification = ulTaskNotifyTake(pdTRUE, xMaxBlockTime/*xNoDelay*/); // Attendre la notification
+            const bool waitingForPayload =
+                iohcRadio::radioState == iohcRadio::RadioState::PREAMBLE;
+            thread_notification = ulTaskNotifyTake(
+                pdTRUE,
+                waitingForPayload ? RX_PREAMBLE_TIMEOUT_TICKS : xMaxBlockTime);
             if (thread_notification &&
                 (iohcRadio::radioState == iohcRadio::RadioState::PAYLOAD ||
                  iohcRadio::radioState == iohcRadio::RadioState::PREAMBLE)) {
                 iohcRadio::tickerCounter((iohcRadio *) pvParameters);
+            } else if (!thread_notification &&
+                       iohcRadio::radioState == iohcRadio::RadioState::PREAMBLE) {
+                // A noise-triggered preamble may never be followed by DIO0.
+                // Do not leave the software state machine wedged forever.
+                Radio::setStandby();
+                Radio::clearFlags();
+                if (Radio::setRx()) {
+                    iohcRadio::setRadioState(iohcRadio::RadioState::RX);
+                } else {
+                    iohcRadio::setRadioState(iohcRadio::RadioState::ERROR);
+                    ets_printf("Radio: failed to recover after preamble timeout\n");
+                }
             }
         }
 
@@ -70,27 +103,30 @@ namespace IOHC {
      * the interrupt service routine is complete.
      */
     void IRAM_ATTR handle_interrupt_fromisr() {
-        bool preamble = digitalRead(RADIO_PREAMBLE_DETECTED);
-        bool payload = digitalRead(RADIO_PACKET_AVAIL);
-        iohcRadio::txComplete = true;
-        ets_printf("TX: TX-RX DONE detected, flag set\n");
+        const bool payload = digitalRead(RADIO_PACKET_AVAIL);
 
+        // DIO0 is PacketSent while transmitting and PayloadReady while
+        // receiving. Never let an RX event handler change the state or touch
+        // SPI while a TX is still in progress.
+        if (iohcRadio::radioState == iohcRadio::RadioState::TX) {
+            if (payload) {
+                iohcRadio::txComplete = true;
+            }
+            return;
+        }
 
+        if (iohcRadio::radioState == iohcRadio::RadioState::ERROR ||
+            iohcRadio::radioState == iohcRadio::RadioState::IDLE) {
+            return;
+        }
+
+        const bool preamble = digitalRead(RADIO_PREAMBLE_DETECTED);
         if (payload) {
-            // When in TX state DIO0 is mapped to PacketSent, otherwise it
-            // signals PayloadReady. Use the current radio state to disambiguate
-            // without touching SPI from the ISR.
-            //if (iohcRadio::radioState == iohcRadio::RadioState::TX) {
-            //    iohcRadio::txComplete = true;
-            //    ets_printf("TX: TXDONE detected, flag set\n");
-            //    iohcRadio::setRadioState(iohcRadio::RadioState::RX);
-            //} else {
-                iohcRadio::setRadioState(iohcRadio::RadioState::PAYLOAD);
-            //}
+            iohcRadio::setRadioState(iohcRadio::RadioState::PAYLOAD);
         } else if (preamble) {
             iohcRadio::setRadioState(iohcRadio::RadioState::PREAMBLE);
         } else {
-            iohcRadio::setRadioState(iohcRadio::RadioState::RX);
+            return;
         }
 
         // Notify de RX state machine
@@ -110,15 +146,25 @@ namespace IOHC {
         }
     }
 
-    iohcRadio::iohcRadio() {
-        Radio::initHardware();
-        Radio::calibrate();
+    bool iohcRadio::configureRadio() {
+        if (!Radio::calibrate()) {
+            return false;
+        }
 
         Radio::initRegisters(MAX_FRAME_LEN);
         Radio::setCarrier(Radio::Carrier::Deviation, 19200);
         Radio::setCarrier(Radio::Carrier::Bitrate, 38400);
         Radio::setCarrier(Radio::Carrier::Bandwidth, 250);
         Radio::setCarrier(Radio::Carrier::Modulation, Radio::Modulation::FSK);
+        return true;
+    }
+
+    iohcRadio::iohcRadio() {
+        if (!Radio::initHardware() || !configureRadio()) {
+            setRadioState(RadioState::ERROR);
+            ets_printf("Radio: initialization failed\n");
+            return;
+        }
 
         // Attach interrupts to Preamble detected and end of packet sent/received
         /* TODO this is wrongly named and/or assigned, but work like that*/
@@ -194,12 +240,22 @@ namespace IOHC {
         this->rxCB = std::move(rxCallback);
         this->txCB = std::move(txCallback);
 
+        if (radioState == RadioState::ERROR) {
+            ets_printf("Radio: startup skipped after initialization failure\n");
+            return;
+        }
+
         Radio::clearBuffer();
         Radio::clearFlags();
         /* We always start at freq[0] the 1W/2W channel*/
         Radio::setCarrier(Radio::Carrier::Frequency, scan_freqs[0]); //868950000);
         // Radio::calibrate();
-        Radio::setRx();
+        if (Radio::setRx()) {
+            setRadioState(RadioState::RX);
+        } else {
+            setRadioState(RadioState::ERROR);
+            ets_printf("Radio: failed to enter RX during startup\n");
+        }
     }
 
 /**
@@ -221,19 +277,9 @@ namespace IOHC {
 
         // If Int of PayLoad
         if (radioState == iohcRadio::RadioState::PAYLOAD) {
-            // if TX ready?
-            if (_flags[0] & RF_IRQFLAGS1_TXREADY) {
-                Radio::clearFlags();
-                if (radioState != iohcRadio::RadioState::TX) {
-                    Radio::setRx();
-                    radio->setRadioState(iohcRadio::RadioState::RX);
-                }
-                // radio->sent(radio->packets2send[radio->txCounter]); // Put after Workaround to permit MQTT sending. No more needed
-                return;
-            }
-            // if in RX mode?
             radio->receive(false);
             Radio::clearFlags();
+            radio->setRadioState(iohcRadio::RadioState::RX);
             radio->tickCounter = 0;
             radio->preCounter = 0;
             return;
@@ -317,7 +363,8 @@ void iohcRadio::queueSend(std::vector<iohcPacket *> &iohcTx) {
 }
 
 void iohcRadio::startQueuedSend() {
-    if (radioState == RadioState::TX || packets2send.size() > 0 || sendQueue.empty()) {
+    if (radioState == RadioState::TX || radioState == RadioState::ERROR ||
+        !packets2send.empty() || sendQueue.empty()) {
         return;
     }
 
@@ -325,28 +372,11 @@ void iohcRadio::startQueuedSend() {
     sendQueue.pop();
     txCounter = 0;
     txComplete = false;
+    txRecoveryAttempts = 0;
     ets_printf("TX: Preparing %d packet(s)\n", packets2send.size());
-    setRadioState(RadioState::TX);
-
-    auto packet = packets2send[txCounter];
-
-    // 🟢 Set long preamble for first packet
-    Radio::setPreambleLength(LONG_PREAMBLE_MS);
-    ets_printf("TX: Using LONG preamble (%d ms)\n", LONG_PREAMBLE_MS);
-
-    // Send first packet immediately
-    Radio::setStandby();
-    Radio::clearFlags();
-    Radio::writeBytes(REG_FIFO, packet->payload.buffer, packet->buffer_length);
-    Radio::setTx();
-    //packetStamp = esp_timer_get_time();
-    //packet->decode(true); //false);
-    //IOHC::lastSendCmd = packet->payload.packet.header.cmd;
-
-    ets_printf("TX: Sent first packet (%d repeats) at %llu us\n", packet->repeat, esp_timer_get_time());
-
-    // Start ticker for repeats (short preamble)
-    Sender.attach_ms(packet->repeatTime, &iohcRadio::onTxTicker, (void*)this);
+    if (!beginCurrentTransmission(LONG_PREAMBLE_BYTES, true)) {
+        handleTxFailure("radio did not enter TX");
+    }
 }
 
 void iohcRadio::send(iohcPacket *packet) {
@@ -359,30 +389,133 @@ void iohcRadio::send(std::vector<iohcPacket *> &iohcTx) {
     startQueuedSend();
 }
 
-
- 
-void iohcRadio::onTxTicker(void *arg) {
-    iohcRadio *radio = (iohcRadio *)arg;
-    auto packet = radio->packets2send[radio->txCounter];
-
-    // 🩵 Fallback: Check IRQFLAGS2 (0x3F) for PacketSent in FSK mode
-    uint8_t irqFlags2 = Radio::readByte(0x3F); // REG_IRQFLAGS2
-    if (irqFlags2 & 0x08) { // Bit 3 == PacketSent (TXDONE in FSK)
-        ets_printf("FSK: Detected PacketSent (TXDONE) via register (ISR missed?)\n");
-        Radio::writeByte(0x3F, 0x08); // Clear PacketSent bit
-        iohcRadio::txComplete = true;
+bool iohcRadio::beginCurrentTransmission(uint16_t preambleBytes, bool armTicker) {
+    if (packets2send.empty() || txCounter >= packets2send.size()) {
+        return false;
     }
 
-    // ⏳ Wait for TXDONE
+    auto *packet = packets2send[txCounter];
+    const uint32_t frequency = packet->frequency ? packet->frequency : scan_freqs[currentFreqIdx];
+
+    txComplete = false;
+    setRadioState(RadioState::TX);
+    Radio::setStandby();
+    Radio::clearFlags();
+    Radio::setCarrier(Radio::Carrier::Frequency, frequency);
+    Radio::setPreambleLength(preambleBytes);
+    Radio::writeBytes(REG_FIFO, packet->payload.buffer, packet->buffer_length);
+
+    txStartedAtUs = esp_timer_get_time();
+    txDeadlineAtUs = txStartedAtUs + txWatchdogDurationUs(preambleBytes, packet->buffer_length);
+    txLastWaitLogAtUs = txStartedAtUs;
+    if (!Radio::setTx()) {
+        return false;
+    }
+
+    ets_printf("TX: Started packet %d/%d, preamble=%u bytes, timeout=%llu ms\n",
+               txCounter + 1,
+               packets2send.size(),
+               preambleBytes,
+               (txDeadlineAtUs - txStartedAtUs + 999ULL) / 1000ULL);
+
+    if (armTicker) {
+        const uint32_t intervalMs = packet->repeatTime ? packet->repeatTime : 1;
+        Sender.attach_ms(intervalMs, &iohcRadio::onTxTicker, (void*)this);
+    }
+    return true;
+}
+
+bool iohcRadio::resetRadio() {
+    if (!Radio::hardReset()) {
+        return false;
+    }
+
+    if (!configureRadio()) {
+        return false;
+    }
+    Radio::clearBuffer();
+    Radio::clearFlags();
+    Radio::setCarrier(Radio::Carrier::Frequency, scan_freqs[currentFreqIdx]);
+    return Radio::setRx();
+}
+
+void iohcRadio::abortCurrentBatch() {
+    for (size_t i = txCounter; i < packets2send.size(); ++i) {
+        delete packets2send[i];
+    }
+    packets2send.clear();
+    txCounter = 0;
+    txComplete = false;
+}
+
+void iohcRadio::handleTxFailure(const char *reason) {
+    const uint8_t irqFlags1 = Radio::readByte(REG_IRQFLAGS1);
+    const uint8_t irqFlags2 = Radio::readByte(REG_IRQFLAGS2);
+    const uint8_t opMode = Radio::readByte(REG_OPMODE);
+    ets_printf("TX: FAILURE: %s (state=%s opmode=0x%02X irq1=0x%02X irq2=0x%02X)\n",
+               reason,
+               radioStateToString(radioState),
+               opMode,
+               irqFlags1,
+               irqFlags2);
+    addLogMessage(String("TX failure: ") + reason);
+
+    Sender.detach();
+    txComplete = false;
+    setRadioState(RadioState::ERROR);
+
+    const bool recovered = resetRadio();
+    if (recovered && txRecoveryAttempts < MAX_TX_RECOVERY_ATTEMPTS &&
+        !packets2send.empty() && txCounter < packets2send.size()) {
+        ++txRecoveryAttempts;
+        ets_printf("TX: Radio recovered, retrying current packet (%u/%u)\n",
+                   txRecoveryAttempts,
+                   MAX_TX_RECOVERY_ATTEMPTS);
+        if (beginCurrentTransmission(LONG_PREAMBLE_BYTES, true)) {
+            return;
+        }
+        ets_printf("TX: Retry could not enter TX\n");
+    }
+
+    ets_printf("TX: Aborting current batch; radio recovered=%s\n", recovered ? "true" : "false");
+    abortCurrentBatch();
+    setRadioState(recovered ? RadioState::RX : RadioState::ERROR);
+    if (recovered) {
+        startQueuedSend();
+    }
+}
+
+void iohcRadio::onTxTicker(void *arg) {
+    iohcRadio *radio = (iohcRadio *)arg;
+    if (radio->packets2send.empty() || radio->txCounter >= radio->packets2send.size()) {
+        radio->handleTxFailure("invalid TX queue state");
+        return;
+    }
+    auto packet = radio->packets2send[radio->txCounter];
+
+    // Poll PacketSent as a fallback if the DIO0 edge was missed.
+    const uint8_t irqFlags2 = Radio::readByte(REG_IRQFLAGS2);
+    if (irqFlags2 & RF_IRQFLAGS2_PACKETSENT) {
+        txComplete = true;
+    }
+
     if (!radio->txComplete) {
-        ets_printf("TX: Waiting for TXDONE... (state=%s)\n", radioStateToString(radio->radioState));
+        const uint64_t now = esp_timer_get_time();
+        if (now >= radio->txDeadlineAtUs) {
+            radio->handleTxFailure("PacketSent timeout");
+            return;
+        }
+        if (now - radio->txLastWaitLogAtUs >= TX_WAIT_LOG_INTERVAL_US) {
+            radio->txLastWaitLogAtUs = now;
+            ets_printf("TX: Waiting for PacketSent (%llu ms remaining)\n",
+                       (radio->txDeadlineAtUs - now + 999ULL) / 1000ULL);
+        }
         return;
     }
 
-    // ✅ TXDONE received
-    ESP_LOGD("RADIO", "TXDONE flag set, ready to send repeat or next packet.\n");
+    ESP_LOGD("RADIO", "PacketSent received after %llu ms\n",
+             (esp_timer_get_time() - radio->txStartedAtUs) / 1000ULL);
 
-    // 🔁 Repeat logic
     if (packet->repeat > 0) {
         packet->repeat--;
         ets_printf("TX: Repeating current packet (%d repeats left)\n", packet->repeat);
@@ -391,15 +524,19 @@ void iohcRadio::onTxTicker(void *arg) {
         radio->sent(packet);
 
         radio->txCounter++;
+        radio->txRecoveryAttempts = 0;
 
 
-        // 🛑 Check if all packets are sent
         if (radio->txCounter == radio->packets2send.size()) {
             ets_printf("TX: All packets sent. Stopping Ticker.\n");
             radio->Sender.detach();
             radio->packets2send.clear();
-            Radio::setRx();
-            radio->setRadioState(RadioState::RX);
+            if (Radio::setRx() || radio->resetRadio()) {
+                radio->setRadioState(RadioState::RX);
+            } else {
+                radio->setRadioState(RadioState::ERROR);
+                addLogMessage("Radio failed to return to RX after TX");
+            }
             radio->startQueuedSend();
             return;
         }
@@ -411,25 +548,9 @@ void iohcRadio::onTxTicker(void *arg) {
                     packet->repeat);
     }
 
-    radio->txComplete = false;
-
-    //Radio::setRx();
-    radio->setRadioState(RadioState::TX); // Stay TX until done
-
-    // 📡 Send next packet (short preamble)
-    Radio::setPreambleLength(SHORT_PREAMBLE_MS);
-    Radio::setStandby();
-    Radio::clearFlags();
-    Radio::writeBytes(REG_FIFO, packet->payload.buffer, packet->buffer_length);
-    Radio::setTx();
-    //packetStamp = esp_timer_get_time();
-    //packet->decode(true); //false);
-    //IOHC::lastSendCmd = packet->payload.packet.header.cmd;
-
-    ets_printf("TX: Sent packet %d/%d at %llu us\n",
-               radio->txCounter + 1,
-               radio->packets2send.size(),
-               esp_timer_get_time());
+    if (!radio->beginCurrentTransmission(SHORT_PREAMBLE_BYTES, false)) {
+        radio->handleTxFailure("radio did not enter TX for repeat");
+    }
 }
 
 bool queueCallback(IohcPacketDelegate* callback, iohcPacket* packet) {

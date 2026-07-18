@@ -76,10 +76,15 @@ namespace IOHC {
 
         private:
             iohcRadio();
+            bool configureRadio();
             bool receive(bool stats);
             bool sent(iohcPacket *packet);
             void queueSend(std::vector<iohcPacket*> &iohcTx);
             void startQueuedSend();
+            bool beginCurrentTransmission(uint16_t preambleBytes, bool armTicker);
+            bool resetRadio();
+            void handleTxFailure(const char *reason);
+            void abortCurrentBatch();
 
             static iohcRadio *_iohcRadio;
             static uint8_t _flags[2];
@@ -91,6 +96,10 @@ namespace IOHC {
             volatile uint32_t preCounter = 0;
             volatile uint8_t txCounter = 0;
             static void IRAM_ATTR onTxTicker(void *arg);
+            uint64_t txStartedAtUs = 0;
+            uint64_t txDeadlineAtUs = 0;
+            uint64_t txLastWaitLogAtUs = 0;
+            uint8_t txRecoveryAttempts = 0;
 
             uint8_t num_freqs = 0;
             uint32_t *scan_freqs{};
