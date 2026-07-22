@@ -31,6 +31,9 @@ namespace {
     constexpr uint64_t TX_WAIT_LOG_INTERVAL_US = 250000;
     constexpr uint8_t MAX_TX_RECOVERY_ATTEMPTS = 1;
     constexpr TickType_t RX_PREAMBLE_TIMEOUT_TICKS = pdMS_TO_TICKS(800);
+    constexpr TickType_t RADIO_HEALTH_INTERVAL_TICKS = pdMS_TO_TICKS(50);
+    constexpr uint8_t MAX_CONSECUTIVE_SPI_FAILURES = 3;
+    constexpr uint8_t MODE_BITS_MASK = static_cast<uint8_t>(~RF_OPMODE_MASK);
 
     uint64_t txWatchdogDurationUs(uint16_t preambleBytes, uint8_t payloadBytes) {
         // FSK RegPreambleSize is expressed in bytes. IO-homecontrol adds start
@@ -70,13 +73,12 @@ namespace IOHC {
      */
     void IRAM_ATTR handle_interrupt_task(void *pvParameters) {
         static uint32_t thread_notification;
-        const TickType_t xMaxBlockTime = pdMS_TO_TICKS(655 * 4); // 218.4 );
         while (true) {
             const bool waitingForPayload =
                 iohcRadio::radioState == iohcRadio::RadioState::PREAMBLE;
             thread_notification = ulTaskNotifyTake(
                 pdTRUE,
-                waitingForPayload ? RX_PREAMBLE_TIMEOUT_TICKS : xMaxBlockTime);
+                waitingForPayload ? RX_PREAMBLE_TIMEOUT_TICKS : RADIO_HEALTH_INTERVAL_TICKS);
             if (thread_notification &&
                 (iohcRadio::radioState == iohcRadio::RadioState::PAYLOAD ||
                  iohcRadio::radioState == iohcRadio::RadioState::PREAMBLE)) {
@@ -94,6 +96,7 @@ namespace IOHC {
                     ets_printf("Radio: failed to recover after preamble timeout\n");
                 }
             }
+            ((iohcRadio *) pvParameters)->monitorRadioHealth();
         }
 
     }
@@ -103,15 +106,13 @@ namespace IOHC {
      * the interrupt service routine is complete.
      */
     void IRAM_ATTR handle_interrupt_fromisr() {
-        const bool payload = digitalRead(RADIO_PACKET_AVAIL);
-
         // DIO0 is PacketSent while transmitting and PayloadReady while
         // receiving. Never let an RX event handler change the state or touch
         // SPI while a TX is still in progress.
         if (iohcRadio::radioState == iohcRadio::RadioState::TX) {
-            if (payload) {
-                iohcRadio::txComplete = true;
-            }
+            // This ISR is attached on the rising edge. DIO4 has no active TX
+            // mapping in our configuration, so a TX-time edge is PacketSent.
+            iohcRadio::txComplete = true;
             return;
         }
 
@@ -120,6 +121,7 @@ namespace IOHC {
             return;
         }
 
+        const bool payload = digitalRead(RADIO_PACKET_AVAIL);
         const bool preamble = digitalRead(RADIO_PREAMBLE_DETECTED);
         if (payload) {
             iohcRadio::setRadioState(iohcRadio::RadioState::PAYLOAD);
@@ -160,6 +162,13 @@ namespace IOHC {
     }
 
     iohcRadio::iohcRadio() {
+        sendMutex = xSemaphoreCreateMutex();
+        if (sendMutex == nullptr) {
+            setRadioState(RadioState::ERROR);
+            ets_printf("Radio: failed to create TX queue mutex\n");
+            return;
+        }
+
         if (!Radio::initHardware() || !configureRadio()) {
             setRadioState(RadioState::ERROR);
             ets_printf("Radio: initialization failed\n");
@@ -358,18 +367,32 @@ void iohcRadio::queueSend(std::vector<iohcPacket *> &iohcTx) {
     if (iohcTx.empty()) {
         return;
     }
+    if (xSemaphoreTake(sendMutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
     sendQueue.push(std::move(iohcTx));
     ets_printf("TX: Queued send batch. Queue depth=%d\n", static_cast<int>(sendQueue.size()));
+    xSemaphoreGive(sendMutex);
 }
 
 void iohcRadio::startQueuedSend() {
     if (radioState == RadioState::TX || radioState == RadioState::ERROR ||
+        !packets2send.empty()) {
+        return;
+    }
+
+    if (xSemaphoreTake(sendMutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    if (radioState == RadioState::TX || radioState == RadioState::ERROR ||
         !packets2send.empty() || sendQueue.empty()) {
+        xSemaphoreGive(sendMutex);
         return;
     }
 
     packets2send = std::move(sendQueue.front());
     sendQueue.pop();
+    xSemaphoreGive(sendMutex);
     txCounter = 0;
     txComplete = false;
     txRecoveryAttempts = 0;
@@ -385,6 +408,14 @@ void iohcRadio::send(iohcPacket *packet) {
 }
 
 void iohcRadio::send(std::vector<iohcPacket *> &iohcTx) {
+    if (radioState == RadioState::ERROR) {
+        ets_printf("TX: Dropping %d packet(s): radio unavailable\n", iohcTx.size());
+        for (auto *packet : iohcTx) {
+            delete packet;
+        }
+        iohcTx.clear();
+        return;
+    }
     queueSend(iohcTx);
     startQueuedSend();
 }
@@ -399,7 +430,9 @@ bool iohcRadio::beginCurrentTransmission(uint16_t preambleBytes, bool armTicker)
 
     txComplete = false;
     setRadioState(RadioState::TX);
-    Radio::setStandby();
+    if (!Radio::setStandby()) {
+        return false;
+    }
     Radio::clearFlags();
     Radio::setCarrier(Radio::Carrier::Frequency, frequency);
     Radio::setPreambleLength(preambleBytes);
@@ -449,6 +482,9 @@ void iohcRadio::abortCurrentBatch() {
 }
 
 void iohcRadio::handleTxFailure(const char *reason) {
+    if (!beginRecovery()) {
+        return;
+    }
     const uint8_t irqFlags1 = Radio::readByte(REG_IRQFLAGS1);
     const uint8_t irqFlags2 = Radio::readByte(REG_IRQFLAGS2);
     const uint8_t opMode = Radio::readByte(REG_OPMODE);
@@ -464,7 +500,7 @@ void iohcRadio::handleTxFailure(const char *reason) {
     txComplete = false;
     setRadioState(RadioState::ERROR);
 
-    const bool recovered = resetRadio();
+    bool recovered = resetRadio();
     if (recovered && txRecoveryAttempts < MAX_TX_RECOVERY_ATTEMPTS &&
         !packets2send.empty() && txCounter < packets2send.size()) {
         ++txRecoveryAttempts;
@@ -472,16 +508,102 @@ void iohcRadio::handleTxFailure(const char *reason) {
                    txRecoveryAttempts,
                    MAX_TX_RECOVERY_ATTEMPTS);
         if (beginCurrentTransmission(LONG_PREAMBLE_BYTES, true)) {
+            endRecovery();
             return;
         }
         ets_printf("TX: Retry could not enter TX\n");
+        // The failed retry may have changed RegOpMode even though readiness
+        // was never reached. Reset once more before exposing a non-TX state.
+        recovered = resetRadio();
     }
 
     ets_printf("TX: Aborting current batch; radio recovered=%s\n", recovered ? "true" : "false");
     abortCurrentBatch();
     setRadioState(recovered ? RadioState::RX : RadioState::ERROR);
+    endRecovery();
     if (recovered) {
         startQueuedSend();
+    }
+}
+
+bool iohcRadio::beginRecovery() {
+    taskENTER_CRITICAL(&recoveryMux);
+    if (recoveryInProgress) {
+        taskEXIT_CRITICAL(&recoveryMux);
+        return false;
+    }
+    recoveryInProgress = true;
+    taskEXIT_CRITICAL(&recoveryMux);
+    return true;
+}
+
+void iohcRadio::endRecovery() {
+    taskENTER_CRITICAL(&recoveryMux);
+    recoveryInProgress = false;
+    taskEXIT_CRITICAL(&recoveryMux);
+}
+
+void iohcRadio::monitorRadioHealth() {
+    if (radioState == RadioState::IDLE || radioState == RadioState::ERROR ||
+        recoveryInProgress) {
+        return;
+    }
+
+    const uint8_t version = Radio::readByte(REG_VERSION);
+    const uint8_t opMode = Radio::readByte(REG_OPMODE) & MODE_BITS_MASK;
+    if (version != 0x12) {
+        if (++consecutiveSpiFailures < MAX_CONSECUTIVE_SPI_FAILURES) {
+            return;
+        }
+        consecutiveSpiFailures = 0;
+        if (radioState == RadioState::TX) {
+            handleTxFailure("SPI link lost during TX");
+            return;
+        }
+
+        if (!beginRecovery()) {
+            return;
+        }
+        ets_printf("Radio: SPI health check failed (version=0x%02X), resetting\n", version);
+        setRadioState(RadioState::ERROR);
+        const bool recovered = resetRadio();
+        setRadioState(recovered ? RadioState::RX : RadioState::ERROR);
+        endRecovery();
+        if (recovered) {
+            startQueuedSend();
+        }
+        return;
+    }
+    consecutiveSpiFailures = 0;
+
+    if (radioState == RadioState::TX) {
+        // Reaching the receive domain while software still reports TX means
+        // the hardware has already left TX and the PA is off.
+        if (opMode == RF_OPMODE_SYNTHESIZER_RX || opMode == RF_OPMODE_RECEIVER) {
+            txComplete = true;
+        } else if (esp_timer_get_time() >= txDeadlineAtUs) {
+            handleTxFailure("independent TX watchdog timeout");
+        }
+        return;
+    }
+
+    // No software state other than TX is ever allowed to leave the PA or its
+    // TX synthesizer enabled. Recover immediately if that invariant breaks.
+    if (opMode == RF_OPMODE_TRANSMITTER || opMode == RF_OPMODE_SYNTHESIZER_TX) {
+        if (!beginRecovery()) {
+            return;
+        }
+        ets_printf("Radio: unsafe TX mode 0x%02X while state=%s; resetting\n",
+                   opMode,
+                   radioStateToString(radioState));
+        Sender.detach();
+        setRadioState(RadioState::ERROR);
+        const bool recovered = resetRadio();
+        setRadioState(recovered ? RadioState::RX : RadioState::ERROR);
+        endRecovery();
+        if (recovered) {
+            startQueuedSend();
+        }
     }
 }
 
@@ -495,7 +617,9 @@ void iohcRadio::onTxTicker(void *arg) {
 
     // Poll PacketSent as a fallback if the DIO0 edge was missed.
     const uint8_t irqFlags2 = Radio::readByte(REG_IRQFLAGS2);
-    if (irqFlags2 & RF_IRQFLAGS2_PACKETSENT) {
+    const uint8_t opMode = Radio::readByte(REG_OPMODE) & MODE_BITS_MASK;
+    if ((irqFlags2 & RF_IRQFLAGS2_PACKETSENT) ||
+        opMode == RF_OPMODE_SYNTHESIZER_RX || opMode == RF_OPMODE_RECEIVER) {
         txComplete = true;
     }
 

@@ -25,7 +25,6 @@
 #if defined(ESP8266)
     #include <TickerUs.h>
 #elif defined(ESP32)
-#define CONFIG_DISABLE_HAL_LOCKS true
 #include <TickerUsESP32.h>
 #include <esp_task_wdt.h>
 #include <SPI.h>
@@ -34,6 +33,46 @@
 
 namespace Radio {
     SPISettings SpiSettings(4000000, MSBFIRST, SPI_MODE0);
+
+    namespace {
+        constexpr uint8_t MODE_BITS_MASK = static_cast<uint8_t>(~RF_OPMODE_MASK);
+        constexpr uint8_t PA_BOOST_2_DBM = RF_PACONFIG_PASELECT_PABOOST | 0x00;
+        constexpr uint8_t OCP_100_MA = RF_OCP_ON | RF_OCP_TRIM_100_MA;
+        constexpr uint8_t PA_DAC_NORMAL = 0x84;
+
+        bool waitForMode(uint8_t expectedMode, uint8_t requiredFlags, uint32_t timeoutUs) {
+            const uint64_t deadline = esp_timer_get_time() + timeoutUs;
+            do {
+                const uint8_t opMode = readByte(REG_OPMODE);
+                const uint8_t irqFlags1 = readByte(REG_IRQFLAGS1);
+                if ((opMode & MODE_BITS_MASK) == expectedMode &&
+                    (irqFlags1 & requiredFlags) == requiredFlags) {
+                    return true;
+                }
+                delayMicroseconds(10);
+            } while (esp_timer_get_time() < deadline);
+            return false;
+        }
+
+        bool waitForReceiveDomain(uint32_t timeoutUs) {
+            const uint64_t deadline = esp_timer_get_time() + timeoutUs;
+            do {
+                const uint8_t opMode = readByte(REG_OPMODE) & MODE_BITS_MASK;
+                const uint8_t irqFlags1 = readByte(REG_IRQFLAGS1);
+                // With AGC/AFC triggered by PreambleDetect, the chip can
+                // legitimately wait in FSRx until a signal arrives. Both
+                // FSRx and Rx have the PA disabled; Tx/FSTx are rejected.
+                if ((opMode == RF_OPMODE_SYNTHESIZER_RX ||
+                     opMode == RF_OPMODE_RECEIVER) &&
+                    (irqFlags1 & RF_IRQFLAGS1_PLLLOCK)) {
+                    return true;
+                }
+                delayMicroseconds(10);
+            } while (esp_timer_get_time() < deadline);
+            return false;
+        }
+
+    }
 
     // Simplified bandwidth registries evaluation
     std::map<uint8_t, regBandWidth> __bw =
@@ -93,7 +132,10 @@ namespace Radio {
         // SPI.setFrequency(SPI_CLK_FRQ);
         // SPI.setDataMode(SPI_MODE0);
         // SPI.setBitOrder(MSBFIRST);
-        SPI.setHwCs(true);
+        // NSS is driven explicitly by SPI_begin/endTransaction. Enabling the
+        // ESP32 hardware-CS at the same time can pulse NSS between bytes and
+        // eventually leave the external SX1276 unreachable.
+        SPI.setHwCs(false);
 
         // Disable SPI device
         // Disable device NRESET pin
@@ -136,13 +178,9 @@ namespace Radio {
         // Reset leaves the FSK modem in Sleep. Image calibration only runs
         // once the oscillator is active in Standby.
         writeByte(REG_OPMODE, RF_OPMODE_STANDBY);
-        const uint64_t readyDeadline = esp_timer_get_time() + 5000;
-        while (!(readByte(REG_IRQFLAGS1) & RF_IRQFLAGS1_MODEREADY)) {
-            if (esp_timer_get_time() >= readyDeadline) {
-                ets_printf("Radio: failed to enter standby after reset\n");
-                return false;
-            }
-            delayMicroseconds(10);
+        if (!waitForMode(RF_OPMODE_STANDBY, RF_IRQFLAGS1_MODEREADY, 5000)) {
+            ets_printf("Radio: failed to enter standby after reset\n");
+            return false;
         }
         return true;
     }
@@ -245,10 +283,12 @@ void setPreambleLength(uint16_t preambleLen) {
             REG_PREAMBLEDETECT,
             RF_PREAMBLEDETECT_DETECTOR_ON | RF_PREAMBLEDETECT_DETECTORSIZE_2 | RF_PREAMBLEDETECT_DETECTORTOL_10);
 
-        // PA boost maximum power
-        writeByte(REG_PACONFIG, RF_PACONFIG_PASELECT_MASK | RF_PACONFIG_PASELECT_PABOOST);
-        writeByte(REG_OCP, RF_OCP_ON | RF_OCP_TRIM_240_MA); // 0x37); //200mA //0x3B 240mA
-        writeByte(REG_PADAC, 0x87); //  RF_PADAC_20DBM_MASK | RF_PADAC_20DBM_ON); // turn 20dBm mode on
+        // Start from the lowest PA_BOOST level. The external module currently
+        // loses SPI as soon as its PA ramps at higher power, which is a strong
+        // indication of a marginal 3V3 rail or wiring drop.
+        writeByte(REG_PACONFIG, PA_BOOST_2_DBM);
+        writeByte(REG_OCP, OCP_100_MA);
+        writeByte(REG_PADAC, PA_DAC_NORMAL);
     }
 
 /**
@@ -341,24 +381,24 @@ void setPreambleLength(uint16_t preambleLen) {
     //     writeByte( REG_PACONFIG, regPaConfigInitVal );
     //     SetChannel( initialFreq );
     // }
-    void IRAM_ATTR setStandby() {
+    bool IRAM_ATTR setStandby(uint32_t readyTimeoutUs) {
         writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_STANDBY);
+        return waitForMode(RF_OPMODE_STANDBY, RF_IRQFLAGS1_MODEREADY, readyTimeoutUs);
     }
 
     bool IRAM_ATTR setTx(uint32_t readyTimeoutUs) {
         // Uncommon and incompatible settings
         // Enabling Sync word - Size must be set to SYNCSIZE_2 (0x01 in header file)
         writeByte(REG_SYNCCONFIG, (readByte(REG_SYNCCONFIG) & RF_SYNCCONFIG_SYNCSIZE_MASK) | RF_SYNCCONFIG_SYNCSIZE_2);
-        writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_TRANSMITTER);
 
-        const uint64_t deadline = esp_timer_get_time() + readyTimeoutUs;
-        while (!(readByte(REG_IRQFLAGS1) & RF_IRQFLAGS1_TXREADY)) {
-            if (esp_timer_get_time() >= deadline) {
-                return false;
-            }
-            delayMicroseconds(10);
-        }
-        return true;
+        writeByte(
+            REG_OPMODE,
+            (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_TRANSMITTER);
+
+        return waitForMode(
+            RF_OPMODE_TRANSMITTER,
+            RF_IRQFLAGS1_TXREADY,
+            readyTimeoutUs);
     }
 
     bool IRAM_ATTR setRx(uint32_t readyTimeoutUs) {
@@ -366,16 +406,9 @@ void setPreambleLength(uint16_t preambleLen) {
         writeByte(REG_SYNCCONFIG, (readByte(REG_SYNCCONFIG) & RF_SYNCCONFIG_SYNCSIZE_MASK) | RF_SYNCCONFIG_SYNCSIZE_3);
         writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_RECEIVER);
 
-        const uint64_t deadline = esp_timer_get_time() + readyTimeoutUs;
-        // The existing receiver sequence intentionally starts as soon as the
-        // RX PLL locks; RxReady is not asserted in every sequencer state.
-        while (!(readByte(REG_IRQFLAGS1) & RF_IRQFLAGS1_PLLLOCK)) {
-            if (esp_timer_get_time() >= deadline) {
-                return false;
-            }
-            delayMicroseconds(10);
-        }
-        return true;
+        // PllLock alone is also high in TX. Combining it with an exact FSRx
+        // or Rx RegOpMode value proves that the PA is disabled.
+        return waitForReceiveDomain(readyTimeoutUs);
         /*
                 // Start Sequencer
                 writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_RECEIVER);
@@ -443,7 +476,7 @@ void setPreambleLength(uint16_t preambleLen) {
         SPI_beginTransaction();
         SPI.transfer(regAddr); // Send Address
         for (uint8_t idx = 0; idx < len; ++idx) {
-            out[idx] = SPI.transfer(regAddr); // Get data
+            out[idx] = SPI.transfer(0x00); // Clock out register data
         }
         SPI_endTransaction();
     }

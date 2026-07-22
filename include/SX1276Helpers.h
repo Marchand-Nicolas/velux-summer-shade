@@ -74,8 +74,8 @@ namespace Radio {
     bool hardReset();
     void initRegisters(uint8_t maxPayloadLength);
     bool calibrate(uint32_t timeoutUs = 100000);
-    void setStandby();
-    bool setTx(uint32_t readyTimeoutUs = 20000);
+    bool setStandby(uint32_t readyTimeoutUs = 20000);
+    bool setTx(uint32_t readyTimeoutUs = 100000);
     bool setRx(uint32_t readyTimeoutUs = 20000);
     void setPreambleLength(uint16_t preambleLen);
     void clearBuffer();

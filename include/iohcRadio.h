@@ -18,6 +18,7 @@
 #define IOHC_RADIO_H
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include <Delegate.h>
@@ -85,6 +86,11 @@ namespace IOHC {
             bool resetRadio();
             void handleTxFailure(const char *reason);
             void abortCurrentBatch();
+            void monitorRadioHealth();
+            bool beginRecovery();
+            void endRecovery();
+
+            friend void handle_interrupt_task(void *pvParameters);
 
             static iohcRadio *_iohcRadio;
             static uint8_t _flags[2];
@@ -100,6 +106,9 @@ namespace IOHC {
             uint64_t txDeadlineAtUs = 0;
             uint64_t txLastWaitLogAtUs = 0;
             uint8_t txRecoveryAttempts = 0;
+            uint8_t consecutiveSpiFailures = 0;
+            volatile bool recoveryInProgress = false;
+            portMUX_TYPE recoveryMux = portMUX_INITIALIZER_UNLOCKED;
 
             uint8_t num_freqs = 0;
             uint32_t *scan_freqs{};
@@ -117,6 +126,7 @@ namespace IOHC {
             IohcPacketDelegate txCB = nullptr;
             std::vector<iohcPacket*> packets2send{};
             std::queue<std::vector<iohcPacket*>> sendQueue{};
+            SemaphoreHandle_t sendMutex = nullptr;
         protected:
             static void i_preamble();
             static void i_payload();
