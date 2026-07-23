@@ -105,6 +105,7 @@ namespace IOHC {
             uint64_t txStartedAtUs = 0;
             uint64_t txDeadlineAtUs = 0;
             uint64_t txLastWaitLogAtUs = 0;
+            uint64_t lastRecoveryAttemptAtUs = 0;
             uint8_t txRecoveryAttempts = 0;
             uint8_t consecutiveSpiFailures = 0;
             volatile bool recoveryInProgress = false;

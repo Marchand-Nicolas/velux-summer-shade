@@ -32,13 +32,51 @@
 #endif
 
 namespace Radio {
-    SPISettings SpiSettings(4000000, MSBFIRST, SPI_MODE0);
+    // The SX1276 supports a faster bus, but 1 MHz gives substantially more
+    // margin on the integrated Heltec routing and during radio recovery.
+    SPISettings SpiSettings(1000000, MSBFIRST, SPI_MODE0);
 
     namespace {
+        bool softwareSpi = false;
+        portMUX_TYPE spiMux = portMUX_INITIALIZER_UNLOCKED;
         constexpr uint8_t MODE_BITS_MASK = static_cast<uint8_t>(~RF_OPMODE_MASK);
-        constexpr uint8_t PA_BOOST_2_DBM = RF_PACONFIG_PASELECT_PABOOST | 0x00;
+        constexpr uint8_t PA_BOOST_10_DBM = RF_PACONFIG_PASELECT_PABOOST | 0x08;
         constexpr uint8_t OCP_100_MA = RF_OCP_ON | RF_OCP_TRIM_100_MA;
         constexpr uint8_t PA_DAC_NORMAL = 0x84;
+        constexpr uint8_t PLL_HF_DEFAULT = RF_PLL_BANDWIDTH_300 | 0x10;
+
+        uint8_t IRAM_ATTR transferByte(uint8_t outgoing) {
+            if (!softwareSpi) {
+                return SPI.transfer(outgoing);
+            }
+
+            uint8_t incoming = 0;
+            for (uint8_t mask = 0x80; mask != 0; mask >>= 1) {
+                digitalWrite(RADIO_SCLK, LOW);
+                digitalWrite(RADIO_MOSI, (outgoing & mask) ? HIGH : LOW);
+                delayMicroseconds(1);
+                digitalWrite(RADIO_SCLK, HIGH);
+                delayMicroseconds(1);
+                incoming = static_cast<uint8_t>(
+                    (incoming << 1) | (digitalRead(RADIO_MISO) ? 1 : 0));
+            }
+            digitalWrite(RADIO_SCLK, LOW);
+            return incoming;
+        }
+
+        void enableSoftwareSpi() {
+            SPI.end();
+            delay(2);
+            pinMode(RADIO_SCLK, OUTPUT);
+            pinMode(RADIO_MOSI, OUTPUT);
+            pinMode(RADIO_MISO, INPUT_PULLUP);
+            pinMode(RADIO_NSS, OUTPUT);
+            digitalWrite(RADIO_SCLK, LOW);
+            digitalWrite(RADIO_MOSI, LOW);
+            digitalWrite(RADIO_NSS, HIGH);
+            softwareSpi = true;
+            ets_printf("Radio: switched to software SPI fallback\n");
+        }
 
         bool waitForMode(uint8_t expectedMode, uint8_t requiredFlags, uint32_t timeoutUs) {
             const uint64_t deadline = esp_timer_get_time() + timeoutUs;
@@ -89,16 +127,29 @@ namespace Radio {
  * The function `SPI_beginTransaction` begins a SPI transaction and sets the RADIO_NSS pin to LOW.
  */
     void IRAM_ATTR SPI_beginTransaction() {
-        SPI.beginTransaction(Radio::SpiSettings);
+        portENTER_CRITICAL(&spiMux);
+        if (!softwareSpi) {
+            SPI.beginTransaction(Radio::SpiSettings);
+        }
         digitalWrite(RADIO_NSS, LOW);
+        if (softwareSpi) {
+            delayMicroseconds(1);
+        }
     }
 
 /**
  * The function `SPI_endTransaction` ends the SPI transaction and sets the RADIO_NSS pin to HIGH.
  */
     void IRAM_ATTR SPI_endTransaction() {
+        if (softwareSpi) {
+            digitalWrite(RADIO_SCLK, LOW);
+            delayMicroseconds(1);
+        }
         digitalWrite(RADIO_NSS, HIGH);
-        SPI.endTransaction();
+        if (!softwareSpi) {
+            SPI.endTransaction();
+        }
+        portEXIT_CRITICAL(&spiMux);
     }
 
 /**
@@ -107,6 +158,7 @@ namespace Radio {
  */
     bool initHardware() {
         printf("\nSPI Init");
+        softwareSpi = false;
 
         //gpio_pullup_en((gpio_num_t) RADIO_MISO);
 
@@ -127,7 +179,10 @@ namespace Radio {
 
         // Initialize SPI bus
 #if defined(ESP32)
-        SPI.begin(RADIO_SCLK, RADIO_MISO, RADIO_MOSI, RADIO_NSS);
+        // NSS is controlled manually. Passing it to SPI.begin() as a hardware
+        // SS pin and then disabling hardware-CS proved unreliable after
+        // repeated ESP32-only resets on this board.
+        SPI.begin(RADIO_SCLK, RADIO_MISO, RADIO_MOSI, -1);
 #endif
         // SPI.setFrequency(SPI_CLK_FRQ);
         // SPI.setDataMode(SPI_MODE0);
@@ -161,15 +216,26 @@ namespace Radio {
     }
 
     bool hardReset() {
-        pinMode(RADIO_NSS, OUTPUT);
-        digitalWrite(RADIO_NSS, HIGH);
-        pinMode(RADIO_RESET, OUTPUT);
-        digitalWrite(RADIO_RESET, LOW);
-        delayMicroseconds(200);
-        digitalWrite(RADIO_RESET, HIGH);
-        delay(6);
+        const auto resetChip = []() {
+            pinMode(RADIO_NSS, OUTPUT);
+            digitalWrite(RADIO_NSS, HIGH);
+            pinMode(RADIO_RESET, OUTPUT);
+            digitalWrite(RADIO_RESET, LOW);
+            delay(2);
+            digitalWrite(RADIO_RESET, HIGH);
+            delay(20);
+            return readByte(REG_VERSION);
+        };
 
-        const uint8_t version = readByte(REG_VERSION);
+        uint8_t version = resetChip();
+        if (version != 0x12) {
+            // The ESP32 hardware SPI controller can become unable to sample
+            // MISO after a failed TX. Bit-banged mode uses the same four pins
+            // but no SPI peripheral, so it remains able to reset and control
+            // the radio instead of leaving it in a potentially jamming mode.
+            enableSoftwareSpi();
+            version = resetChip();
+        }
         if (version != 0x12) {
             ets_printf("Radio: reset failed, unexpected version 0x%02X\n", version);
             return false;
@@ -185,10 +251,13 @@ namespace Radio {
         return true;
     }
 
-void setPreambleLength(uint16_t preambleLen) {
-    writeByte(REG_PREAMBLEMSB, (preambleLen >> 8) & 0xFF);
-    writeByte(REG_PREAMBLELSB, preambleLen & 0xFF);
+bool setPreambleLength(uint16_t preambleLen) {
+    const bool msbWritten =
+        writeByte(REG_PREAMBLEMSB, (preambleLen >> 8) & 0xFF, true);
+    const bool lsbWritten =
+        writeByte(REG_PREAMBLELSB, preambleLen & 0xFF, true);
     ets_printf("Radio: Preamble length set to %u bytes\n", preambleLen);
+    return msbWritten && lsbWritten;
 }
 
 /**
@@ -200,54 +269,62 @@ void setPreambleLength(uint16_t preambleLen) {
  * value of `0xff` (255 in decimal). This parameter is used to configure the radio module to handle
  * packets
  */
-    void initRegisters(uint8_t maxPayloadLength = 0xff) {
+    bool initRegisters(uint8_t maxPayloadLength) {
+        bool configured = true;
+        const auto setRegister = [&configured](uint8_t reg, uint8_t value) {
+            if (!writeByte(reg, value, true)) {
+                ets_printf("Radio: register 0x%02X rejected value 0x%02X\n", reg, value);
+                configured = false;
+            }
+        };
+
         // Firstly put radio in StandBy mode as some parameters cannot be changed differently
-        writeByte(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_STANDBY);
+        setRegister(REG_OPMODE, (readByte(REG_OPMODE) & RF_OPMODE_MASK) | RF_OPMODE_STANDBY);
 
         // ---------------- Common Register init section ----------------
         // Switch-off clockout
-        writeByte(REG_OSC, RF_OSC_CLKOUT_OFF); // This only give power saveing maybe we can use it as ticker µs
+        setRegister(REG_OSC, RF_OSC_CLKOUT_OFF); // This only give power saveing maybe we can use it as ticker µs
 
         // Variable packet lenght, generates working CRC.
         // Packet mode, IoHomeOn, IoHomePowerFrame to be added (0x10) to avoid rx to newly detect the preamble during tx radio shutdown
         // Must CRCAUTOCLEAR_ON or do full clean FIFO !
-        writeByte(
+        setRegister(
             REG_PACKETCONFIG1,
             RF_PACKETCONFIG1_PACKETFORMAT_VARIABLE | RF_PACKETCONFIG1_DCFREE_OFF | RF_PACKETCONFIG1_CRC_ON |
             RF_PACKETCONFIG1_CRCAUTOCLEAR_ON | RF_PACKETCONFIG1_CRCWHITENINGTYPE_CCITT |
             RF_PACKETCONFIG1_ADDRSFILTERING_OFF);
-        writeByte(
+        setRegister(
             REG_PACKETCONFIG2,
             RF_PACKETCONFIG2_DATAMODE_PACKET | RF_PACKETCONFIG2_IOHOME_ON | RF_PACKETCONFIG2_IOHOME_POWERFRAME);
         // Is IoHomePowerFrame useful ?
 
         // Preamble shall be set to AA for packets to be received by appliances. Sync word shall be set with different values if Rx or Tx
-        writeByte(
+        setRegister(
             REG_SYNCCONFIG,
             RF_SYNCCONFIG_AUTORESTARTRXMODE_WAITPLL_OFF | RF_SYNCCONFIG_PREAMBLEPOLARITY_AA | RF_SYNCCONFIG_SYNC_ON);
         //0x51); // 0x91); // TODOVERIFY 0x92
         //RF_SYNCCONFIG_AUTORESTARTRXMODE_WAITPLL_ON | RF_SYNCCONFIG_PREAMBLEPOLARITY_AA | RF_SYNCCONFIG_SYNC_ON);
 
         // Set Sync word to 0xff33 both for rx and tx
-        writeByte(REG_SYNCVALUE1, SYNC_BYTE_1);
-        writeByte(REG_SYNCVALUE2, SYNC_BYTE_2);
+        setRegister(REG_SYNCVALUE1, SYNC_BYTE_1);
+        setRegister(REG_SYNCVALUE2, SYNC_BYTE_2);
 
         // Mapping of pins DIO0 to DIO3
         // DIO0: PayloadReady|PacketSent    DIO1: FIFO empty    DIO2: Sync   | DIO3: TxReady
         // Mapping of pins DIO4 and DIO5
         // DIO4: PreambleDetect  DIO5: Data
         // DIO Mapping Data Packet Table 30 Page 69
-        writeByte(
+        setRegister(
             REG_DIOMAPPING1,
             RF_DIOMAPPING1_DIO0_00 | RF_DIOMAPPING1_DIO1_01 | RF_DIOMAPPING1_DIO2_11 | RF_DIOMAPPING1_DIO3_01); // Org
         //        writeByte(REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_00 | RF_DIOMAPPING1_DIO1_01 | RF_DIOMAPPING1_DIO2_10 | RF_DIOMAPPING1_DIO3_01); // timeout on DIO2 for test
-        writeByte(REG_DIOMAPPING2, RF_DIOMAPPING2_MAP_PREAMBLEDETECT | RF_DIOMAPPING2_DIO4_11 | RF_DIOMAPPING2_DIO5_10);
+        setRegister(REG_DIOMAPPING2, RF_DIOMAPPING2_MAP_PREAMBLEDETECT | RF_DIOMAPPING2_DIO4_11 | RF_DIOMAPPING2_DIO5_10);
         // Preamble on DIO4
 
         // Enable Fast Hoping (frequency change) // Not needed all the time
         // Not using that, as it miss a lot of frames
         if (MAX_FREQS != 1)
-            writeByte(REG_PLLHOP, readByte(REG_PLLHOP) | RF_PLLHOP_FASTHOP_ON);
+            setRegister(REG_PLLHOP, readByte(REG_PLLHOP) | RF_PLLHOP_FASTHOP_ON);
 
         // ---------------- TX Register init section ----------------
         // PA boost maximum power
@@ -256,39 +333,46 @@ void setPreambleLength(uint16_t preambleLen) {
         // writeByte(REG_PADAC, 0x87); // turn 20dBm mode on
 
         // PA Ramp: No Shaping, Ramp up/down 15us
-        writeByte(REG_PARAMP, RF_PARAMP_MODULATIONSHAPING_00 | RF_PARAMP_0012_US); //_0015_US); //_0031_US); //
+        setRegister(REG_PARAMP, RF_PARAMP_MODULATIONSHAPING_00 | RF_PARAMP_0012_US); //_0015_US); //_0031_US); //
         // Setting Preamble Length
-        writeByte(REG_PREAMBLEMSB, PREAMBLE_MSB);
-        writeByte(REG_PREAMBLELSB, PREAMBLE_LSB);
+        setRegister(REG_PREAMBLEMSB, PREAMBLE_MSB);
+        setRegister(REG_PREAMBLELSB, PREAMBLE_LSB);
         // FIFO Threshold - currently useless
-        writeByte(REG_FIFOTHRESH, RF_FIFOTHRESH_TXSTARTCONDITION_FIFONOTEMPTY);
+        setRegister(REG_FIFOTHRESH, RF_FIFOTHRESH_TXSTARTCONDITION_FIFONOTEMPTY);
 
         // ---------------- RX Register init section ----------------
-        // Set lenght checking if passed as parameter
-        // The use of maxPayloadLength is not working. Prevents generating PayloadReady signal
-        writeByte(REG_PAYLOADLENGTH, 0xff);
+        // Length filtering is intentionally disabled. Using maxPayloadLength
+        // here prevents PayloadReady for valid variable-length io-homecontrol
+        // frames on this modem.
+        (void)maxPayloadLength;
+        setRegister(REG_PAYLOADLENGTH, 0xff);
         // RSSI precision +-2dBm
-        writeByte(REG_RSSICONFIG, RF_RSSICONFIG_SMOOTHING_8); // 8->0.512 ms // _128); // _32); //_256); //
+        setRegister(REG_RSSICONFIG, RF_RSSICONFIG_SMOOTHING_8); // 8->0.512 ms // _128); // _32); //_256); //
         // Activates Timeout interrupt on Preamble
-        writeByte(REG_RXCONFIG, RF_RXCONFIG_AFCAUTO_ON | RF_RXCONFIG_AGCAUTO_ON | RF_RXCONFIG_RXTRIGER_PREAMBLEDETECT | RF_RXCONFIG_RESTARTRXONCOLLISION_ON);
+        setRegister(REG_RXCONFIG, RF_RXCONFIG_AFCAUTO_ON | RF_RXCONFIG_AGCAUTO_ON | RF_RXCONFIG_RXTRIGER_PREAMBLEDETECT | RF_RXCONFIG_RESTARTRXONCOLLISION_ON);
         // 250KHz BW with AFC
-        writeByte(REG_AFCBW, RF_AFCBW_MANTAFC_16 | RF_AFCBW_EXPAFC_1);
+        setRegister(REG_AFCBW, RF_AFCBW_MANTAFC_16 | RF_AFCBW_EXPAFC_1);
 
-        writeByte(REG_AFCFEI, 0x01);
+        setRegister(REG_AFCFEI, 0x01);
         // if AGC_AUTO_ON, RF_LNA_GAIN_XX do nothing
-        writeByte(REG_LNA, RF_LNA_BOOST_ON | RF_LNA_GAIN_G1); // 0xC3) ;
+        setRegister(REG_LNA, RF_LNA_BOOST_ON | RF_LNA_GAIN_G1); // 0xC3) ;
 
         // Enables Preamble Detect, 2 bytes
-        writeByte(
+        setRegister(
             REG_PREAMBLEDETECT,
             RF_PREAMBLEDETECT_DETECTOR_ON | RF_PREAMBLEDETECT_DETECTORSIZE_2 | RF_PREAMBLEDETECT_DETECTORTOL_10);
 
-        // Start from the lowest PA_BOOST level. The external module currently
-        // loses SPI as soon as its PA ramps at higher power, which is a strong
-        // indication of a marginal 3V3 rail or wiring drop.
-        writeByte(REG_PACONFIG, PA_BOOST_2_DBM);
-        writeByte(REG_OCP, OCP_100_MA);
-        writeByte(REG_PADAC, PA_DAC_NORMAL);
+        // +2 dBm reached PacketSent but not the installed Velux reliably.
+        // +10 dBm restores practical indoor link margin while remaining well
+        // below the former +20 dBm setting that destabilized the 3V3 rail.
+        setRegister(REG_PACONFIG, PA_BOOST_10_DBM);
+        setRegister(REG_OCP, OCP_100_MA);
+        setRegister(REG_PADAC, PA_DAC_NORMAL);
+
+        // RegPll is not restored reliably by every NRESET recovery observed
+        // on the board. Program the documented HF default explicitly.
+        setRegister(REG_PLL, PLL_HF_DEFAULT);
+        return configured;
     }
 
 /**
@@ -474,9 +558,9 @@ void setPreambleLength(uint16_t preambleLen) {
 
     void IRAM_ATTR readBytes(uint8_t regAddr, uint8_t *out, uint8_t len) {
         SPI_beginTransaction();
-        SPI.transfer(regAddr); // Send Address
+        transferByte(regAddr); // Send Address
         for (uint8_t idx = 0; idx < len; ++idx) {
-            out[idx] = SPI.transfer(0x00); // Clock out register data
+            out[idx] = transferByte(0x00); // Clock out register data
         }
         SPI_endTransaction();
     }
@@ -486,27 +570,35 @@ void setPreambleLength(uint16_t preambleLen) {
     }
 
     auto IRAM_ATTR writeBytes(uint8_t regAddr, uint8_t *in, uint8_t len, bool check) -> bool {
-        SPI_beginTransaction();
-        SPI.write(regAddr | SPI_Write); // Send Address with Write flag
-        for (uint8_t idx = 0; idx < len; ++idx) {
-            SPI.write(in[idx]); // Send data
-        }
-        SPI_endTransaction();
-
-        if (check) {
+        constexpr uint8_t maxAttempts = 3;
+        for (uint8_t attempt = 0; attempt < maxAttempts; ++attempt) {
             SPI_beginTransaction();
-            SPI.transfer(regAddr); // Send Address
+            transferByte(regAddr | SPI_Write);
             for (uint8_t idx = 0; idx < len; ++idx) {
-                uint8_t getByte = SPI.transfer(regAddr); // Get data
-                if (in[idx] != getByte) {
-                    SPI_endTransaction();
-                    return false;
+                transferByte(in[idx]);
+            }
+            SPI_endTransaction();
+
+            if (!check) {
+                return true;
+            }
+
+            bool matches = true;
+            SPI_beginTransaction();
+            transferByte(regAddr);
+            for (uint8_t idx = 0; idx < len; ++idx) {
+                if (transferByte(0x00) != in[idx]) {
+                    matches = false;
                 }
             }
             SPI_endTransaction();
+            if (matches) {
+                return true;
+            }
+            delayMicroseconds(20);
         }
 
-        return true;
+        return false;
     }
 
     uint16_t IRAM_ATTR readWord(uint8_t regAddr) {
@@ -546,20 +638,17 @@ void setPreambleLength(uint16_t preambleLen) {
                 out[0] = (tmpVal & 0x00ff0000) >> 16;
                 out[1] = (tmpVal & 0x0000ff00) >> 8;
                 out[2] = (tmpVal & 0x000000ff); // If Radio is active writing LSB triggers frequency change
-                writeBytes(REG_FRFMSB, out, 3);
-                break;
+                return writeBytes(REG_FRFMSB, out, 3, true);
             case Carrier::Bandwidth:
                 bw = bwRegs(value);
-                writeByte(REG_RXBW, bw.Mant | bw.Exp);
-                writeByte(REG_AFCBW, bw.Mant | bw.Exp);
-                break;
+                return writeByte(REG_RXBW, bw.Mant | bw.Exp, true) &&
+                       writeByte(REG_AFCBW, bw.Mant | bw.Exp, true);
             case Carrier::Deviation:
                 tmpVal = static_cast<uint32_t>((static_cast<float_t>(value) / FXOSC) * (1 << 19));
                 out[0] = (tmpVal & 0x0000ff00) >> 8;
                 out[1] = (tmpVal & 0x000000ff);
-                writeBytes(REG_FDEVMSB, out, 2);
+                return writeBytes(REG_FDEVMSB, out, 2, true);
             //                writeByte(REG_BITRATEFRAC, 5); // Little more precision
-                break;
             case Carrier::Modulation:
                 switch (value) {
                     case Modulation::FSK: {
@@ -571,23 +660,55 @@ void setPreambleLength(uint16_t preambleLen) {
                         rfOpMode &= RF_OPMODE_MASK;
                         rfOpMode |= RF_OPMODE_STANDBY;
                         rfOpMode &= ~0x08;
-                        writeByte(REG_OPMODE, rfOpMode);
-                        break;
+                        return writeByte(REG_OPMODE, rfOpMode, true);
                     }
                     case Modulation::LoRa:
                     case Modulation::OOK:
-                    default: break;
+                    default: return false;
                 }
-                break;
             case Carrier::Bitrate:
                 tmpVal = FXOSC / value;
                 out[0] = (tmpVal & 0x0000ff00) >> 8;
                 out[1] = (tmpVal & 0x000000ff);
-                writeBytes(REG_BITRATEMSB, out, 2);
-                break;
+                return writeBytes(REG_BITRATEMSB, out, 2, true);
         }
 
-        return true;
+        return false;
+    }
+
+    bool validateConfiguration(uint32_t expectedFrequency) {
+        bool valid = true;
+        const auto expect = [&valid](uint8_t reg, uint8_t expected, uint8_t mask = 0xFF) {
+            const uint8_t actual = readByte(reg);
+            if ((actual & mask) != (expected & mask)) {
+                ets_printf("Radio: invalid reg 0x%02X, got 0x%02X expected 0x%02X mask 0x%02X\n",
+                           reg, actual, expected, mask);
+                valid = false;
+            }
+        };
+
+        expect(REG_VERSION, 0x12);
+        expect(REG_PACONFIG, PA_BOOST_10_DBM);
+        expect(REG_OCP, OCP_100_MA);
+        expect(REG_PADAC, PA_DAC_NORMAL);
+        expect(REG_PLL, PLL_HF_DEFAULT);
+        expect(REG_BITRATEMSB, 0x03);
+        expect(REG_BITRATELSB, 0x41);
+        expect(REG_FDEVMSB, 0x01);
+        expect(REG_FDEVLSB, 0x3A);
+        expect(REG_PACKETCONFIG2,
+               RF_PACKETCONFIG2_DATAMODE_PACKET |
+               RF_PACKETCONFIG2_IOHOME_ON |
+               RF_PACKETCONFIG2_IOHOME_POWERFRAME);
+
+        if (expectedFrequency != 0) {
+            const uint32_t frf =
+                static_cast<uint32_t>((static_cast<float_t>(expectedFrequency) / FXOSC) * (1 << 19));
+            expect(REG_FRFMSB, (frf >> 16) & 0xFF);
+            expect(REG_FRFMID, (frf >> 8) & 0xFF);
+            expect(REG_FRFLSB, frf & 0xFF);
+        }
+        return valid;
     }
 
     regBandWidth bwRegs(uint8_t bandwidth) {

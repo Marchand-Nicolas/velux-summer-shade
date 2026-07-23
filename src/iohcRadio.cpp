@@ -33,6 +33,9 @@ namespace {
     constexpr TickType_t RX_PREAMBLE_TIMEOUT_TICKS = pdMS_TO_TICKS(800);
     constexpr TickType_t RADIO_HEALTH_INTERVAL_TICKS = pdMS_TO_TICKS(50);
     constexpr uint8_t MAX_CONSECUTIVE_SPI_FAILURES = 3;
+    constexpr uint64_t ERROR_RECOVERY_INTERVAL_US = 2000000ULL;
+    constexpr uint8_t RADIO_RESET_ATTEMPTS = 3;
+    constexpr size_t MAX_QUEUED_SEND_BATCHES = 8;
     constexpr uint8_t MODE_BITS_MASK = static_cast<uint8_t>(~RF_OPMODE_MASK);
 
     uint64_t txWatchdogDurationUs(uint16_t preambleBytes, uint8_t payloadBytes) {
@@ -153,12 +156,12 @@ namespace IOHC {
             return false;
         }
 
-        Radio::initRegisters(MAX_FRAME_LEN);
-        Radio::setCarrier(Radio::Carrier::Deviation, 19200);
-        Radio::setCarrier(Radio::Carrier::Bitrate, 38400);
-        Radio::setCarrier(Radio::Carrier::Bandwidth, 250);
-        Radio::setCarrier(Radio::Carrier::Modulation, Radio::Modulation::FSK);
-        return true;
+        return Radio::initRegisters(MAX_FRAME_LEN) &&
+               Radio::setCarrier(Radio::Carrier::Deviation, 19200) &&
+               Radio::setCarrier(Radio::Carrier::Bitrate, 38400) &&
+               Radio::setCarrier(Radio::Carrier::Bandwidth, 250) &&
+               Radio::setCarrier(Radio::Carrier::Modulation, Radio::Modulation::FSK) &&
+               Radio::validateConfiguration();
     }
 
     iohcRadio::iohcRadio() {
@@ -169,10 +172,33 @@ namespace IOHC {
             return;
         }
 
-        if (!Radio::initHardware() || !configureRadio()) {
+        // Create the callback infrastructure before radio initialization.
+        // A later successful recovery must never find a null queue.
+        callbackQueue = xQueueCreate(20, sizeof(struct Callback *));
+        auto callbackTaskCode =
+            xTaskCreatePinnedToCore(callbackTaskLoop, "CallbackTask", 4096,
+                                    NULL, 5, &callbackTask, 0);
+        if (callbackTaskCode != pdPASS || callbackQueue == NULL) {
             setRadioState(RadioState::ERROR);
-            ets_printf("Radio: initialization failed\n");
+            ets_printf("ERROR: Can't create callback task or queue %d\n", callbackTaskCode);
             return;
+        }
+
+        bool radioInitialized = false;
+        for (uint8_t attempt = 1; attempt <= RADIO_RESET_ATTEMPTS; ++attempt) {
+            const bool hardwareReady =
+                attempt == 1 ? Radio::initHardware() : Radio::hardReset();
+            if (hardwareReady && configureRadio()) {
+                radioInitialized = true;
+                break;
+            }
+            ets_printf("Radio: initialization attempt %u/%u failed\n",
+                       attempt, RADIO_RESET_ATTEMPTS);
+            delay(10);
+        }
+        if (!radioInitialized) {
+            setRadioState(RadioState::ERROR);
+            ets_printf("Radio: initialization failed; background recovery enabled\n");
         }
 
         // Attach interrupts to Preamble detected and end of packet sent/received
@@ -188,14 +214,6 @@ namespace IOHC {
 #elif defined(CC1101)
         attachInterrupt(RADIO_PREAMBLE_DETECTED, i_preamble, RISING);
 #endif
-
-        callbackQueue = xQueueCreate(20, sizeof(struct Callback *));
-        auto callbackTaskCode = xTaskCreatePinnedToCore(callbackTaskLoop, "CallbackTask", 4096, NULL, 5, &callbackTask, 0);
-        if (callbackTaskCode != pdPASS || callbackQueue == NULL) {
-            printf("ERROR: Can't create callback-task or corresponding queue %d\n", callbackTaskCode);
-            // sx127x_destroy(device);
-            return;
-        }
 
         // start state machine
         printf("Starting Interrupt Handler...\n");
@@ -257,7 +275,12 @@ namespace IOHC {
         Radio::clearBuffer();
         Radio::clearFlags();
         /* We always start at freq[0] the 1W/2W channel*/
-        Radio::setCarrier(Radio::Carrier::Frequency, scan_freqs[0]); //868950000);
+        if (!Radio::setCarrier(Radio::Carrier::Frequency, scan_freqs[0]) ||
+            !Radio::validateConfiguration(scan_freqs[0])) {
+            setRadioState(RadioState::ERROR);
+            ets_printf("Radio: invalid startup configuration\n");
+            return;
+        }
         // Radio::calibrate();
         if (Radio::setRx()) {
             setRadioState(RadioState::RX);
@@ -370,6 +393,16 @@ void iohcRadio::queueSend(std::vector<iohcPacket *> &iohcTx) {
     if (xSemaphoreTake(sendMutex, portMAX_DELAY) != pdTRUE) {
         return;
     }
+    if (sendQueue.size() >= MAX_QUEUED_SEND_BATCHES) {
+        ets_printf("TX: Queue full; rejecting %d packet(s)\n",
+                   static_cast<int>(iohcTx.size()));
+        for (auto *packet : iohcTx) {
+            delete packet;
+        }
+        iohcTx.clear();
+        xSemaphoreGive(sendMutex);
+        return;
+    }
     sendQueue.push(std::move(iohcTx));
     ets_printf("TX: Queued send batch. Queue depth=%d\n", static_cast<int>(sendQueue.size()));
     xSemaphoreGive(sendMutex);
@@ -408,15 +441,22 @@ void iohcRadio::send(iohcPacket *packet) {
 }
 
 void iohcRadio::send(std::vector<iohcPacket *> &iohcTx) {
-    if (radioState == RadioState::ERROR) {
-        ets_printf("TX: Dropping %d packet(s): radio unavailable\n", iohcTx.size());
-        for (auto *packet : iohcTx) {
-            delete packet;
-        }
-        iohcTx.clear();
-        return;
-    }
+    // Take ownership immediately. If the radio is temporarily unavailable,
+    // background recovery will start this batch as soon as RX is restored.
     queueSend(iohcTx);
+
+    if (radioState == RadioState::ERROR) {
+        if (beginRecovery()) {
+            const bool recovered = resetRadio();
+            setRadioState(recovered ? RadioState::RX : RadioState::ERROR);
+            lastRecoveryAttemptAtUs = esp_timer_get_time();
+            endRecovery();
+        }
+        if (radioState == RadioState::ERROR) {
+            ets_printf("TX: Radio unavailable; queued batch will wait for recovery\n");
+            return;
+        }
+    }
     startQueuedSend();
 }
 
@@ -434,8 +474,11 @@ bool iohcRadio::beginCurrentTransmission(uint16_t preambleBytes, bool armTicker)
         return false;
     }
     Radio::clearFlags();
-    Radio::setCarrier(Radio::Carrier::Frequency, frequency);
-    Radio::setPreambleLength(preambleBytes);
+    if (!Radio::setCarrier(Radio::Carrier::Frequency, frequency) ||
+        !Radio::setPreambleLength(preambleBytes) ||
+        !Radio::validateConfiguration(frequency)) {
+        return false;
+    }
     Radio::writeBytes(REG_FIFO, packet->payload.buffer, packet->buffer_length);
 
     txStartedAtUs = esp_timer_get_time();
@@ -459,17 +502,25 @@ bool iohcRadio::beginCurrentTransmission(uint16_t preambleBytes, bool armTicker)
 }
 
 bool iohcRadio::resetRadio() {
-    if (!Radio::hardReset()) {
-        return false;
+    const uint32_t frequency = scan_freqs[currentFreqIdx];
+    for (uint8_t attempt = 1; attempt <= RADIO_RESET_ATTEMPTS; ++attempt) {
+        if (Radio::hardReset() &&
+            configureRadio() &&
+            Radio::setCarrier(Radio::Carrier::Frequency, frequency) &&
+            Radio::validateConfiguration(frequency)) {
+            Radio::clearBuffer();
+            Radio::clearFlags();
+            if (Radio::setRx() && Radio::validateConfiguration(frequency)) {
+                ets_printf("Radio: recovery validated on attempt %u/%u\n",
+                           attempt, RADIO_RESET_ATTEMPTS);
+                return true;
+            }
+        }
+        ets_printf("Radio: recovery attempt %u/%u failed validation\n",
+                   attempt, RADIO_RESET_ATTEMPTS);
+        delay(10);
     }
-
-    if (!configureRadio()) {
-        return false;
-    }
-    Radio::clearBuffer();
-    Radio::clearFlags();
-    Radio::setCarrier(Radio::Carrier::Frequency, scan_freqs[currentFreqIdx]);
-    return Radio::setRx();
+    return false;
 }
 
 void iohcRadio::abortCurrentBatch() {
@@ -544,8 +595,23 @@ void iohcRadio::endRecovery() {
 }
 
 void iohcRadio::monitorRadioHealth() {
-    if (radioState == RadioState::IDLE || radioState == RadioState::ERROR ||
-        recoveryInProgress) {
+    if (radioState == RadioState::IDLE || recoveryInProgress) {
+        return;
+    }
+
+    if (radioState == RadioState::ERROR) {
+        const uint64_t now = esp_timer_get_time();
+        if (now - lastRecoveryAttemptAtUs < ERROR_RECOVERY_INTERVAL_US ||
+            !beginRecovery()) {
+            return;
+        }
+        lastRecoveryAttemptAtUs = now;
+        const bool recovered = resetRadio();
+        setRadioState(recovered ? RadioState::RX : RadioState::ERROR);
+        endRecovery();
+        if (recovered) {
+            startQueuedSend();
+        }
         return;
     }
 
@@ -678,6 +744,9 @@ void iohcRadio::onTxTicker(void *arg) {
 }
 
 bool queueCallback(IohcPacketDelegate* callback, iohcPacket* packet) {
+    if (callbackQueue == NULL) {
+        return false;
+    }
     Callback *callbackData = (Callback*) pvPortMalloc(sizeof(Callback));
     if (callbackData == NULL) {
         return false;

@@ -16,6 +16,7 @@ constexpr const char *kTimeZoneParis = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 constexpr uint32_t kCheckIntervalMs = 60UL * 1000UL;
 constexpr uint32_t kNtpRetryIntervalMs = 10UL * 60UL * 1000UL;
 constexpr uint32_t kTimePersistIntervalMs = 30UL * 60UL * 1000UL;
+constexpr uint32_t kStartupGraceMs = 10UL * 1000UL;
 constexpr time_t kValidEpochThreshold = 1700000000; // 2023-11-14
 
 TaskHandle_t s_schedulerTask = nullptr;
@@ -159,6 +160,9 @@ void schedulerTask(void *) {
     setenv("TZ", kTimeZoneParis, 1);
     tzset();
     restoreLastKnownTimeIfNeeded();
+    // Let the ESP32 Wi-Fi and SX1276 initialization settle before the first
+    // scheduled transmission.
+    vTaskDelay(pdMS_TO_TICKS(kStartupGraceMs));
 
     while (true) {
         ensureNtpConfigured();
