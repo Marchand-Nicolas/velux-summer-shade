@@ -160,6 +160,17 @@ namespace Radio {
         printf("\nSPI Init");
         softwareSpi = false;
 
+        // Disable any onboard radio chip so it does not contend on the shared
+        // SPI bus when an external module is used.
+#ifdef ONBOARD_RADIO_RST_PIN
+        pinMode(ONBOARD_RADIO_RST_PIN, OUTPUT);
+        digitalWrite(ONBOARD_RADIO_RST_PIN, LOW);
+#endif
+#ifdef ONBOARD_RADIO_CS_PIN
+        pinMode(ONBOARD_RADIO_CS_PIN, OUTPUT);
+        digitalWrite(ONBOARD_RADIO_CS_PIN, HIGH);
+#endif
+
         //gpio_pullup_en((gpio_num_t) RADIO_MISO);
 
         pinMode(RADIO_MISO, INPUT_PULLUP);
@@ -216,6 +227,15 @@ namespace Radio {
     }
 
     bool hardReset() {
+        // Re-enable hardware SPI on each recovery attempt. The ESP32 SPI
+        // peripheral recovers after a full radio reset, so there is no reason
+        // to stay stuck in the slow bit-banged path indefinitely.
+        if (softwareSpi) {
+            softwareSpi = false;
+            SPI.begin(RADIO_SCLK, RADIO_MISO, RADIO_MOSI, -1);
+            SPI.setHwCs(false);
+        }
+
         const auto resetChip = []() {
             pinMode(RADIO_NSS, OUTPUT);
             digitalWrite(RADIO_NSS, HIGH);

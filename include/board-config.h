@@ -45,6 +45,11 @@
 #define BOARD_LED_PIN       25
 #define RADIO_DIO1_PIN      35
 #define RADIO_DIO2_PIN      33 // Wired to SX1276 DIO4 for preamble detection
+// Heltec WiFi LoRa 32 V3 onboard SX1262 pin assignments. These must be held
+// in their inactive state so the onboard chip does not contend on the shared
+// SPI bus (SCK/MISO/MOSI) when an external SX1276 module is used.
+#define ONBOARD_RADIO_CS_PIN  18  // SX1262 NSS
+#define ONBOARD_RADIO_RST_PIN 23  // SX1262 RST
 #elif defined(LILYGO)
 #define RADIO_SCLK_PIN       5
 #define RADIO_MISO_PIN      19
