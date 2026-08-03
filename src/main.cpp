@@ -113,12 +113,11 @@ void setup() {
     // Mount LittleFS filesystem
 #if defined(ESP32)
     // LittleFS.begin(); // Original call, replaced by new init below
-    if(!LittleFS.begin()){
-        Serial.println("An Error has occurred while mounting LittleFS");
-        // Handle error appropriately, maybe by halting or indicating failure
-        return;
+    if (!LittleFS.begin(true)) { // format on fail: a corrupted FS must not block startup
+        Serial.println("An Error has occurred while mounting LittleFS, continuing without filesystem");
+    } else {
+        Serial.println("LittleFS mounted successfully");
     }
-    Serial.println("LittleFS mounted successfully");
 #endif
     nvs_init();
 

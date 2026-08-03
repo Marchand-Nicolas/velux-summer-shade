@@ -42,6 +42,9 @@ void displayTask(void *);
 const int MILLIS_BETWEEN_DISPLAY_UPDATE_SLOW = 5000;
 const int MILLIS_BETWEEN_DISPLAY_UPDATE_FAST = 100;
 const int SECONDS_BEFORE_SCREENSAVER = 60;
+const int DISPLAY_ON_HOUR = 10;  // screen turns on at 10:00 local time
+const int DISPLAY_OFF_HOUR = 22; // screen turns off at 22:00 local time
+const int DISPLAY_BOOT_GRACE_MS = 10000; // keep screen on this long after boot, even at night
 const time_t VALID_CLOCK_THRESHOLD = 1700000000; // 2023-11-14
 const char *DISPLAY_TIME_ZONE = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
@@ -358,6 +361,27 @@ void drawLogo() {
     display.print(getClockText().c_str());
 }
 
+bool isWithinDisplayHours() {
+    if (static_cast<int>(millis()) < DISPLAY_BOOT_GRACE_MS) {
+        return true; // just booted: keep display on briefly regardless of schedule
+    }
+
+    const time_t now = time(nullptr);
+    if (now < VALID_CLOCK_THRESHOLD) {
+        return true; // clock not synced yet: keep display on
+    }
+
+    tm localTime {};
+    if (localtime_r(&now, &localTime) == nullptr) {
+        return true;
+    }
+
+    if (DISPLAY_ON_HOUR < DISPLAY_OFF_HOUR) {
+        return localTime.tm_hour >= DISPLAY_ON_HOUR && localTime.tm_hour < DISPLAY_OFF_HOUR;
+    }
+    return localTime.tm_hour >= DISPLAY_ON_HOUR || localTime.tm_hour < DISPLAY_OFF_HOUR;
+}
+
 void displayTask(void *) {
     bool taskDisplayOn = true;
     while (true) {
@@ -366,7 +390,7 @@ void displayTask(void *) {
                                                             : MILLIS_BETWEEN_DISPLAY_UPDATE_SLOW);
         ulTaskNotifyTake(pdTRUE, waitTicks);
 
-        if (displayEnabled) {
+        if (displayEnabled && isWithinDisplayHours()) {
             if (!taskDisplayOn) {
                 display.ssd1306_command(SSD1306_DISPLAYON);
                 taskDisplayOn = true;
